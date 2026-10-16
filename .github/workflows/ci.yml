@@ -1,0 +1,54 @@
+# The workflow only calls Makefile targets: the Makefile defines the checks, and locally they run
+# with the same commands (make ci, make image). See docs/conventions.md, section 13.
+#
+# Steps run sequentially: a failed check stops the job and the image is not built.
+# There is no integration step: the project has no integration tests (unit tests use stubs).
+name: CI
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+    branches: [ "master", "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: -mod=readonly
+
+jobs:
+  checks-and-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # full history: `git describe` sets the version embedded into the binary
+          fetch-depth: 0
+
+      # the Go version from go.mod: govulncheck checks that version's standard library
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # proto-check requires protoc when CI is set; the protoc version header is ignored by the diff
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      # check tools (golangci-lint, govulncheck) are installed into ./bin at versions pinned in make/common.mk
+      - uses: actions/cache@v4
+        with:
+          path: bin
+          key: ${{ runner.os }}-tools-${{ hashFiles('make/common.mk') }}
+
+      - name: Checks
+        run: make ci
+
+      - name: Image
+        run: make image BUILD_TAGS=release IMAGE="bridge-kafka-service:${{ github.sha }}"

@@ -1,0 +1,200 @@
+# Local stand: 4-broker Kafka (ZooKeeper mode), Kafka UI and the bridge.
+# Local test services (an upstream and an audit sink) go in compose.override.yaml next to this file:
+# docker compose merges it automatically when it exists.
+#
+# Each broker has two listeners:
+#   INTERNAL  kafka:29092 ... kafka4:29095     - for containers in kafka-network
+#   EXTERNAL  localhost:39092 ... localhost:39095 - for clients running on the host
+#
+# Build and runtime images default to public golang:1.27.2 and alpine:3.21 (see Dockerfile); others:
+#   BUILDER_IMAGE=... RUNTIME_IMAGE=... docker compose up -d --build
+
+x-kafka-common: &kafka-common
+  image: confluentinc/cp-kafka:7.4.0
+  restart: unless-stopped
+  depends_on:
+    zookeeper:
+      condition: service_healthy
+  networks:
+    - kafka-network
+
+x-kafka-env: &kafka-env
+  KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+  KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+  # 4 brokers: internal topics are replicated 3 times and survive the loss of one broker.
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "22181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - kafka-network
+
+  kafka:
+    <<: *kafka-common
+    container_name: kafka-server-1
+    hostname: kafka
+    ports:
+      - "39092:39092"
+    environment:
+      <<: *kafka-env
+      KAFKA_BROKER_ID: 1
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:39092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:39092
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29092 >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  kafka2:
+    <<: *kafka-common
+    container_name: kafka-server-2
+    hostname: kafka2
+    ports:
+      - "39093:39093"
+    environment:
+      <<: *kafka-env
+      KAFKA_BROKER_ID: 2
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29093,EXTERNAL://0.0.0.0:39093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka2:29093,EXTERNAL://localhost:39093
+    volumes:
+      - kafka2_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29093 >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  kafka3:
+    <<: *kafka-common
+    container_name: kafka-server-3
+    hostname: kafka3
+    ports:
+      - "39094:39094"
+    environment:
+      <<: *kafka-env
+      KAFKA_BROKER_ID: 3
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29094,EXTERNAL://0.0.0.0:39094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka3:29094,EXTERNAL://localhost:39094
+    volumes:
+      - kafka3_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29094 >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  kafka4:
+    <<: *kafka-common
+    container_name: kafka-server-4
+    hostname: kafka4
+    ports:
+      - "39095:39095"
+    environment:
+      <<: *kafka-env
+      KAFKA_BROKER_ID: 4
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29095,EXTERNAL://0.0.0.0:39095
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka4:29095,EXTERNAL://localhost:39095
+    volumes:
+      - kafka4_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29095 >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka2:
+        condition: service_healthy
+      kafka3:
+        condition: service_healthy
+      kafka4:
+        condition: service_healthy
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092,kafka2:29093,kafka3:29094,kafka4:29095
+    networks:
+      - kafka-network
+
+  bridge-kafka-service:
+    image: bridge-kafka-service:dev
+    container_name: bridge-kafka-service
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # from the environment; unset means the Dockerfile default, see README
+        BUILDER_IMAGE: ${BUILDER_IMAGE:-}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-}
+        BUILT_BY: docker-dev
+    env_file: ./docker.env
+    volumes:
+      # the repository configs (config_app.yaml, config_consumer.yaml, config_producer.yaml)
+      - ./configs:/go/src/bridge-kafka-service/configs:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka2:
+        condition: service_healthy
+      kafka3:
+        condition: service_healthy
+      kafka4:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    healthcheck:
+      # wget on alpine, curl on ubi-minimal
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8081/healthz || curl -fsS -o /dev/null http://localhost:8081/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - kafka-network
+
+networks:
+  kafka-network:
+    driver: bridge
+
+volumes:
+  zookeeper_data:
+  zookeeper_log:
+  kafka_data:
+  kafka2_data:
+  kafka3_data:
+  kafka4_data:

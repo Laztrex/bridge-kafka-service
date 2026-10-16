@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package controller_kafka;
+
+option go_package = "bridge-kafka-service/internal/transport/modelrpc;modelrpc";
+
+
+/*
+ * Request
+ */
+message ModelInterfaceRequest {
+  map<string, string> details = 1;
+  bytes data = 2;
+}
+
+
+/*
+ * Response
+ */
+message ModelInterfaceResponse {
+  bytes data = 1;
+}
+
+
+/*
+ * Service
+ */
+service BaseModelInterface {
+
+  // Make prediction based on user request
+  rpc Predict(ModelInterfaceRequest) returns (ModelInterfaceResponse);
+}

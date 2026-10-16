@@ -1,0 +1,89 @@
+{
+  "LogLevel": "debug",
+  "HTTPAddr": "0.0.0.0:8081",
+  "PprofAddr": "",
+  "AuditEndpoint": "audit-grpc-svc:50053",
+  "KafkaTLSCert": "",
+  "KafkaTLSKey": "",
+  "KafkaTLSCA": "",
+  "KafkaTLSSkip": true,
+  "Brokers": [
+    "kafka:29092",
+    "kafka2:29093",
+    "kafka3:29094",
+    "kafka4:29095"
+  ],
+  "Version": "2.3.0",
+  "Consumers": [
+    {
+      "Topics": [
+        "bridge.requests.1"
+      ],
+      "Group": "bridge.stand",
+      "ClientID": "bridge-stand",
+      "ResponseTopic": "bridge.responses.1",
+      "Name": "app-svc",
+      "Port": "8080",
+      "Path": "/predict",
+      "MaxConn": 0,
+      "TimeoutNs": 300000000000,
+      "Protocol": "",
+      "TLSMode": "",
+      "TLSCAPath": "",
+      "TLSCertPath": "",
+      "TLSKeyPath": "",
+      "TLSServerName": "",
+      "TLSSkipVerify": false
+    },
+    {
+      "Topics": [
+        "bridge.requests.2"
+      ],
+      "Group": "bridge.stand",
+      "ClientID": "bridge-stand",
+      "ResponseTopic": "bridge.responses.shared",
+      "Name": "app-svc2",
+      "Port": "8000",
+      "Path": "/predict",
+      "MaxConn": 0,
+      "TimeoutNs": 300000000000,
+      "Protocol": "",
+      "TLSMode": "",
+      "TLSCAPath": "",
+      "TLSCertPath": "",
+      "TLSKeyPath": "",
+      "TLSServerName": "",
+      "TLSSkipVerify": false
+    },
+    {
+      "Topics": [
+        "bridge.requests.3"
+      ],
+      "Group": "bridge.stand",
+      "ClientID": "bridge-stand",
+      "ResponseTopic": "bridge.responses.shared",
+      "Name": "app-svc",
+      "Port": "8080",
+      "Path": "/predict",
+      "MaxConn": 0,
+      "TimeoutNs": 300000000000,
+      "Protocol": "",
+      "TLSMode": "",
+      "TLSCAPath": "",
+      "TLSCertPath": "",
+      "TLSKeyPath": "",
+      "TLSServerName": "",
+      "TLSSkipVerify": false
+    }
+  ],
+  "Producers": [
+    "bridge.publish.out",
+    "bridge.responses.shared",
+    "bridge.responses.1"
+  ],
+  "LogPath": "",
+  "LogFileName": "",
+  "MetricPath": "",
+  "MetricFile": "",
+  "SystemID": ""
+}

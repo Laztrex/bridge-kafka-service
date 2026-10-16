@@ -1,0 +1,48 @@
+{
+  "LogLevel": "info",
+  "HTTPAddr": "127.0.0.1:8081",
+  "PprofAddr": "",
+  "AuditEndpoint": "",
+  "KafkaTLSCert": "",
+  "KafkaTLSKey": "",
+  "KafkaTLSCA": "",
+  "KafkaTLSSkip": false,
+  "Brokers": [
+    "kafka:29092",
+    "kafka2:29093",
+    "kafka3:29094",
+    "kafka4:29095"
+  ],
+  "Version": "2.3.0",
+  "Consumers": [
+    {
+      "Topics": [
+        "demo.in"
+      ],
+      "Group": "demo.bridge",
+      "ClientID": "demo",
+      "ResponseTopic": "demo.out",
+      "Name": "localhost",
+      "Port": "8000",
+      "Path": "/predict",
+      "MaxConn": 0,
+      "TimeoutNs": 300000000000,
+      "Protocol": "",
+      "TLSMode": "",
+      "TLSCAPath": "",
+      "TLSCertPath": "",
+      "TLSKeyPath": "",
+      "TLSServerName": "",
+      "TLSSkipVerify": false
+    }
+  ],
+  "Producers": [
+    "demo.out",
+    "demo.http.out"
+  ],
+  "LogPath": "",
+  "LogFileName": "",
+  "MetricPath": "",
+  "MetricFile": "",
+  "SystemID": ""
+}

@@ -1,0 +1,54 @@
+logLevel: debug
+http.addr: 0.0.0.0:8081
+
+kafka:
+  brokers: kafka:29092,kafka2:29093,kafka3:29094,kafka4:29095
+  version: 2.3.0
+
+consumer:
+  - topics: bridge.requests.1
+    group: bridge.stand
+    client_id: bridge-stand
+    service:
+      name: "app-svc"
+      port: "8080"
+      path: "/predict"
+#      max_conn: 3
+#      protocol: grpc            # http (default) | grpc; for grpc `path` is not used
+#      tls:                      # encryption to the service; omitted = plaintext
+#        mode: mtls              # none (default) | tls | mtls
+#        ca_path: certs/ca.pem
+#        cert_path: certs/client.pem
+#        key_path: certs/client.key
+    response_topic: bridge.responses.1
+#    on_failure: retry           # skip (default) | retry; retry requires service.max_conn > 0
+
+  - topics: bridge.requests.2
+    group: bridge.stand
+    client_id: bridge-stand
+    service:
+      name: "app-svc2"
+      port: "8000"
+      path: "/predict"
+#      max_conn: 3
+    response_topic: bridge.responses.shared
+
+  - topics: bridge.requests.3
+    group: bridge.stand
+    client_id: bridge-stand
+    service:
+      name: "app-svc"
+      port: "8080"
+      path: "/predict"
+#      max_conn: 3
+    response_topic: bridge.responses.shared
+
+producer:
+  - topic: bridge.publish.out
+  - topic: bridge.responses.shared
+  - topic: bridge.responses.1
+
+kafka.tls.skip.insecure.verify: true
+
+audit:
+  grpc_endpoint: "audit-grpc-svc:50053"

@@ -1,0 +1,7 @@
+# Allowlist: the image is built from these paths only (see Dockerfile).
+# Everything else (configs, certs, tests, docs, tools) stays out of the build context.
+*
+!go.mod
+!go.sum
+!cmd
+!internal

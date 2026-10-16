@@ -1,0 +1,55 @@
+# Edge cases the former viper-based loader accepted; kept to pin backward compatibility.
+LogLevel: warn
+http:
+  addr: 0.0.0.0:9090
+pprof:
+  addr: 127.0.0.1:6060
+audit.grpc_endpoint: als:50051
+kafka:
+  brokers:
+    - b1:9092
+    - b2:9092
+  version: "2.8.0"
+  tls:
+    client:
+      cert:
+        path: certs/c.pem
+      key:
+        path: certs/c.key
+    ca:
+      path: certs/ca.pem
+    skip:
+      insecure:
+        verify: "true"
+consumer:
+  - topics:
+      - t1
+      - t2
+    group: g1
+    client_id: c1
+    service:
+      name: my-svc
+      port: 9000
+      max_conn: "4"
+      timeout: 15
+      protocol: GRPC
+      tls:
+        mode: TLS
+        server_name: svc.internal
+    response_topic: out1
+    unknown_consumer_key: ignored
+  - topics: a,b
+    group: g2
+    service:
+      name: other-svc
+  - topics: solo
+    group: g3
+    service:
+      name: timed
+      timeout: 2s
+producer:
+  - topic: out1
+  - topic: 7
+LOG_PATH: /var/log/bridge
+system_id: FROM_YAML
+unknown_top_level: ignored

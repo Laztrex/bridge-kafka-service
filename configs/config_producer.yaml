@@ -1,0 +1,20 @@
+net:
+  maxopenrequests: 1
+  tls:
+    enable: false
+producer:
+  requiredacks: -1
+  offsets:
+    autocommit:
+      enable: false
+    initial: -1
+  retry:
+    max: 30
+    backoff: 100ms
+  return:
+    successes: true
+    errors: true
+metadata:
+  allowautotopiccreation: true
+
+OffsetsAutoCommitInterval: 1s

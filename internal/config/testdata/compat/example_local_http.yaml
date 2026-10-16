@@ -1,0 +1,24 @@
+# Bridge on the host, Kafka from docker-compose, HTTP upstream = test_app from docker-compose.
+#   docker compose up -d zookeeper kafka kafka2 kafka3 kafka4 test-app-svc
+#   (add to /etc/hosts:  127.0.0.1 kafka kafka2 kafka3 kafka4)
+#   ./bridge-kafka-service --config examples/config_local_http.yaml
+logLevel: info
+http.addr: 127.0.0.1:8081
+
+kafka:
+  brokers: kafka:29092,kafka2:29093,kafka3:29094,kafka4:29095
+  version: 2.3.0
+
+consumer:
+  - topics: demo.in
+    group: demo.bridge
+    client_id: demo
+    service:
+      name: localhost
+      port: "8000"          # test_app, published by docker-compose as 8000
+      path: /predict
+    response_topic: demo.out
+
+producer:
+  - topic: demo.out         # response_topic must be listed here
+  - topic: demo.http.out    # target of POST /api/v1/publish

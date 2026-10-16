@@ -1,0 +1,41 @@
+schema: spec-driven
+
+context: |
+  Project: bridge-kafka-service.
+  Purpose: bridge between Kafka topics and external services. Consumes records,
+  forwards them to a configured upstream (HTTP or gRPC per consumer, optional TLS/mTLS),
+  publishes the upstream response to a response topic, and exposes an HTTP
+  publish API. Every step is audited as Envoy ALS entries and metric lines.
+  Tech stack: Go 1.27.2 (module `bridge-kafka-service`), IBM/sarama, YAML
+  configs under `configs/`, zerolog, the standard flag package, gRPC (upstream Predict + Envoy ALS v3), net/http ServeMux.
+  Layout: cmd/bridge-kafka-service (entrypoint), internal/{app,router,transport,
+  codec,config,logging,middlewares,handlers,observability,schemas,consts},
+  testutil/ (mocks), scripts/, make/, docs/.
+  Conventions:
+    - Wire-level identifiers keep legacy `controller-kafka` names (headers
+      `x-controller-kafka-*`, metric names, ALS values, gRPC method
+      `/controller_kafka.BaseModelInterface/Predict`); see spec project-identity.
+    - Offsets are settled only after full processing (at-least-once).
+    - Tests mock Kafka/gRPC/HTTP boundaries via testutil/; `make test` runs -race;
+      `make coverage-check` enforces 80% total / 60% per package (see spec quality-gates);
+      `make ci` runs fmt-check, vet, tests, lint, govulncheck, the gate and `proto-check`
+      (generated gRPC stubs in internal/transport/modelrpc must match service.proto).
+  Language: everything in the repository (code comments, logs, README, docs, specs) is English.
+
+rules:
+  proposal:
+    - State which existing capability specs are affected
+    - Include a Non-goals section
+  specs:
+    - Use SHALL/MUST wording and at least one #### Scenario per requirement
+    - Never rename legacy wire identifiers without an explicit migration plan
+  tasks:
+    - Include a final task to run `make ci`
+
+operations:
+  apply:
+    guidance:
+      - Run `go build ./... && go vet ./... && go test -race ./...` before marking tasks done
+  archive:
+    guidance:
+      - Sync delta specs into openspec/specs before archiving

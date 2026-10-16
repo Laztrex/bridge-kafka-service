@@ -1,0 +1,25 @@
+# A minimal linter set; extend gradually.
+version: "2"
+
+run:
+  build-tags:
+    - integration
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - unused
+  exclusions:
+    rules:
+      # In tests and test helpers, unclosed Close/Release and the like do not affect the result.
+      - path: (_test\.go|^test/harness/|^testutil/)
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt

@@ -1,0 +1,15 @@
+net:
+  maxopenrequests: 1
+  tls:
+    enable: false
+consumer:
+  offsets:
+    autocommit:
+      enable: true
+    initial: -1
+  return:
+    errors: true
+metadata:
+  allowautotopiccreation: true
+
+OffsetsAutoCommitInterval: 1s

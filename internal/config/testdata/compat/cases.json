@@ -1,0 +1,13 @@
+[
+  {"name": "stand", "file": "stand.yaml"},
+  {"name": "example_grpc", "file": "example_grpc.yaml"},
+  {"name": "example_grpc_mtls", "file": "example_grpc_mtls.yaml"},
+  {"name": "example_local_http", "file": "example_local_http.yaml"},
+  {"name": "edge", "file": "edge.yaml"},
+  {"name": "edge_env", "file": "edge.yaml", "env": {
+    "HTTP_ADDR": "1.2.3.4:1", "LOGLEVEL": "error", "PPROF_ADDR": "", "AUDIT_GRPC_ENDPOINT": "env-als:1",
+    "KAFKA_TLS_CA_PATH": "env-ca.pem", "KAFKA_TLS_SKIP_INSECURE_VERIFY": "false",
+    "LOG_PATH": "/env/log", "LOG_FILE_NAME": "env.log", "METRIC_PATH": "/env/metric", "METRIC_FILE_NAME": "env-metrics.log",
+    "SYSTEM_ID": "FROM_ENV", "OTHER_SVC_SERVICE_PORT": "7777"}},
+  {"name": "stand_env_ports", "file": "stand.yaml", "env": {"APP_SVC_SERVICE_PORT": "1111", "APP_SVC2_SERVICE_PORT": "2222"}}
+]
