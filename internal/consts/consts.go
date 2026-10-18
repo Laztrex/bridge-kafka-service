@@ -34,8 +34,8 @@ const (
 
 const (
 	HeaderKafkaKey         = "x-kafka-key"
-	HeaderProduceTopicName = "x-controller-kafka-produce-topic"
-	CustomHeaderPrefix     = "x-controller-kafka-header-"
+	HeaderProduceTopicName = "x-bridge-kafka-produce-topic"
+	CustomHeaderPrefix     = "x-bridge-kafka-header-"
 )
 
 // Default Kafka TLS material, used when kafka.tls.* paths are unset.

@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/IBM/sarama"
+
 	"bridge-kafka-service/internal/consts"
 	"bridge-kafka-service/internal/schemas"
 )
@@ -258,7 +260,9 @@ func dotenvValue(path, key string) string {
 }
 
 // Validate checks that the Kafka setup can work: brokers are set, every active consumer has a
-// group and a service, and there is at least one active consumer or producer.
+// group and a service, and there is at least one active consumer or producer. With active
+// consumers, a kafka.version below 0.10.2 is rejected because consumer groups need it; an
+// unparseable version is left to the client's fallback, which supports groups.
 func Validate(k *schemas.KafkaInfo) error {
 	if len(k.Brokers) == 0 {
 		return errors.New("no Kafka bootstrap brokers defined")
@@ -274,6 +278,11 @@ func Validate(k *schemas.KafkaInfo) error {
 		}
 		if consumer.Service.Name == "" {
 			return fmt.Errorf("no service host defined for consumer #%d", i+1)
+		}
+	}
+	if hasActiveConsumers {
+		if v, err := sarama.ParseKafkaVersion(k.Version); err == nil && !v.IsAtLeast(sarama.V0_10_2_0) {
+			return fmt.Errorf("kafka.version %q is below 0.10.2, required by consumer groups", k.Version)
 		}
 	}
 	for _, producer := range k.Producers {

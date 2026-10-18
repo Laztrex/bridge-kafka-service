@@ -10,7 +10,7 @@ The system MUST select between fast mode and slow mode based solely on the value
 
 #### Scenario: Fast mode chosen
 - **WHEN** a pipeline starts with `service.max_conn: 0` (or unset)
-- **THEN** each consumed record triggers an independent outbound HTTP request without concurrency limiting
+- **THEN** each consumed record triggers an independent outbound request, limited only by the fast-mode in-flight ceiling
 
 #### Scenario: Slow mode chosen
 - **WHEN** a pipeline starts with `service.max_conn: 10`
@@ -50,9 +50,35 @@ The system MUST funnel every successful upstream response into a shared response
 - **THEN** the wait ends within the shutdown timeout, the response is not published by that call and the originating message is not settled, so it is redelivered after restart
 
 #### Scenario: Responses drained without producers
-- **WHEN** consumers are active but no producers are configured (or producer creation failed)
+- **WHEN** consumers are active, no producers are configured and a `skip` stanza produces a response for its `response_topic`
 - **THEN** the response-publication loop still runs, fails each response event with a logged "no producer" error, and settles it, so the channel never fills with unconsumed events
 
 #### Scenario: No response topic configured
 - **WHEN** a pipeline has no response topic
 - **THEN** responses bypass the publication channel entirely
+
+### Requirement: Fast-mode in-flight ceiling
+In fast mode the system MUST keep at most 512 upstream calls in flight per pipeline. When the ceiling is reached, the pipeline MUST NOT start another call or take another record from Kafka until a call finishes. On shutdown, a dispatch waiting for the ceiling MUST return immediately. The ceiling MUST be stated in the fast-mode startup log line.
+
+#### Scenario: Burst below the ceiling
+- **WHEN** 100 records arrive in fast mode while the upstream is slow
+- **THEN** 100 calls are in flight concurrently
+
+#### Scenario: Catch-up burst above the ceiling
+- **WHEN** 2000 records are available in fast mode and the upstream answers slowly
+- **THEN** no more than 512 calls are in flight at any time, and the remaining records are processed as calls finish
+
+#### Scenario: Shutdown at the ceiling
+- **WHEN** the pipeline is stopped while 512 calls are in flight and another record waits for a free slot
+- **THEN** the waiting dispatch returns immediately and that record is not settled
+
+### Requirement: Upstream connection reuse
+For an HTTP upstream the system MUST keep up to the pipeline's concurrency limit (`service.max_conn` in slow mode, the fast-mode ceiling in fast mode) of idle connections to the upstream, so that a steady number of concurrent calls reuses connections instead of opening a new one per call. Pipelines MUST NOT share an HTTP connection pool.
+
+#### Scenario: Steady concurrency reuses connections
+- **WHEN** a slow-mode pipeline with `max_conn: 8` makes 200 calls with 8 in flight at a time to a keep-alive HTTP upstream
+- **THEN** the upstream sees a small bounded number of new connections over the whole run (the limit plus a small transient overshoot of the client's dialler), far fewer than the number of calls
+
+#### Scenario: Separate pools per pipeline
+- **WHEN** two pipelines call two different upstreams
+- **THEN** idle connections of one pipeline are not counted against or reused by the other

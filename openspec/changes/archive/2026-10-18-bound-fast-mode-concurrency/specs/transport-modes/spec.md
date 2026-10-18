@@ -35,7 +35,7 @@ For an HTTP upstream the system MUST keep up to the pipeline's concurrency limit
 
 #### Scenario: Steady concurrency reuses connections
 - **WHEN** a slow-mode pipeline with `max_conn: 8` makes 200 calls with 8 in flight at a time to a keep-alive HTTP upstream
-- **THEN** the upstream sees at most 8 new connections over the whole run
+- **THEN** the upstream sees a small bounded number of new connections over the whole run (the limit plus a small transient overshoot of the client's dialler), far fewer than the number of calls
 
 #### Scenario: Separate pools per pipeline
 - **WHEN** two pipelines call two different upstreams

@@ -33,7 +33,8 @@ var trackingHeaders = []string{
 }
 
 // publishUpstreamResponse queues the response event for the response topic (if any) and hands
-// it the ack. On a full queue the response is dropped, unless wait is set (on_failure: retry):
+// it the ack. The event carries the stanza config, so the response publisher can apply its
+// failure policy. On a full queue the response is dropped, unless wait is set (on_failure: retry):
 // then it waits until abandon is cancelled and returns errPublishAbandoned, keeping the ack.
 // Tracking headers are always set under their wire names, even if the upstream did not echo them.
 func publishUpstreamResponse(abandon context.Context, msg *schemas.ConsumerEvent, resp UpstreamResponse, wait bool) error {
@@ -80,6 +81,7 @@ func publishUpstreamResponse(abandon context.Context, msg *schemas.ConsumerEvent
 		},
 		Event:         msg.Event,
 		ResponseTopic: msg.ResponseTopic,
+		Config:        msg.Config,
 	}
 	publishEvent.SetAck(msg.TakeAck())
 

@@ -94,15 +94,47 @@ If the transaction/metric log file cannot be opened, the service MUST log the er
 - **THEN** startup aborts with an error and no consumers are started
 
 ### Requirement: One producer shared by all producer topics
-When at least one `producer:` entry is configured, the system MUST create exactly one Sarama sync producer and expose it under every configured producer topic; the topic list acts as an allow-list for publishing. On shutdown the producer MUST be closed exactly once. Startup ordering and HTTP behaviour while the producer is unavailable are specified by `health-probe` and `control-api`.
+When at least one `producer:` entry is configured, the system MUST create exactly one Sarama sync producer and expose it under every configured producer topic; the topic list acts as an allow-list for publishing. On shutdown the producer MUST be closed exactly once. If the producer cannot be created within the retry window while any active consumer stanza has a `response_topic`, the process MUST exit non-zero before any consumer reads a record. Startup ordering and HTTP behaviour while the producer is unavailable are specified by `health-probe` and `control-api`.
 
 #### Scenario: Three producer topics
 - **WHEN** three producer topics are configured
 - **THEN** one producer is created, all three topics resolve to it, and it is closed once on exit
 
 #### Scenario: Producer creation fails permanently
-- **WHEN** the producer cannot be created after the retry window
+- **WHEN** the producer cannot be created after the retry window and no active consumer stanza has a `response_topic`
 - **THEN** the error is logged, no topic is registered, and consumption still runs
+
+#### Scenario: Producer creation fails permanently while responses are expected
+- **WHEN** the producer cannot be created after the retry window and at least one active consumer stanza has a `response_topic`
+- **THEN** the error is logged, no consumer reads a record, and the process exits with a non-zero code so the supervisor restarts it
+
+#### Scenario: Consumers wait for the producer
+- **WHEN** a consumer client is ready before the producer and a consumer stanza has a `response_topic`
+- **THEN** that consumer does not read records until the producer is connected
+
+### Requirement: Kafka version supports consumer groups
+
+When at least one consumer stanza is active, startup MUST fail if `kafka.version` parses to a Kafka version below 0.10.2, the minimum required by consumer groups; the error MUST name the configured value and the minimum. A value that cannot be parsed MUST keep the existing fallback (2.7.0) and MUST NOT stop startup. A configuration without active consumer stanzas MUST NOT be checked.
+
+#### Scenario: Version too old for consumer groups
+
+- **WHEN** `kafka.version` is `0.10.1.0` and a consumer stanza has topics
+- **THEN** startup fails before the HTTP server starts, with an error naming `0.10.1.0` and the minimum `0.10.2`
+
+#### Scenario: Minimum version accepted
+
+- **WHEN** `kafka.version` is `0.10.2.0` and a consumer stanza has topics
+- **THEN** startup proceeds
+
+#### Scenario: Unparseable version keeps the fallback
+
+- **WHEN** `kafka.version` cannot be parsed
+- **THEN** startup proceeds and consumer clients use version 2.7.0
+
+#### Scenario: Producer-only configuration
+
+- **WHEN** `kafka.version` is `0.10.1.0` and no consumer stanza has topics
+- **THEN** startup proceeds
 
 ## Technical Notes
 

@@ -12,6 +12,27 @@ import (
 	"bridge-kafka-service/internal/schemas"
 )
 
+// FastModeMaxInFlight is the built-in ceiling on concurrent upstream calls of a
+// fast-mode pipeline (service.max_conn <= 0): high enough that normal operation
+// never reaches it, low enough to stay well under the common soft ulimit -n of
+// 1024 together with the Kafka, metrics and audit sockets. An operator who
+// needs a different limit already has service.max_conn.
+const FastModeMaxInFlight = 512
+
+// fastModeLimit is the effective fast-mode ceiling; a variable only so that
+// tests can lower it.
+var fastModeLimit = FastModeMaxInFlight
+
+// concurrencyLimit is the pipeline's in-flight ceiling: service.max_conn when
+// set (slow mode), the built-in fast-mode ceiling otherwise. One rule for the
+// dispatch semaphore and the upstream connection pool.
+func concurrencyLimit(conf *schemas.ConsumerConfig) int {
+	if conf.Service.MaxConn > 0 {
+		return conf.Service.MaxConn
+	}
+	return fastModeLimit
+}
+
 func ConsumerResponseFast(
 	logTransaction schemas.TransactionLogger,
 	conf *schemas.ConsumerConfig,
@@ -20,10 +41,10 @@ func ConsumerResponseFast(
 	ctx context.Context,
 ) {
 	log.Info().Msgf(
-		"fast mode for %s:%s%s (max_conn: %d)",
-		conf.Service.Name, conf.Service.Port, conf.Service.Path, conf.Service.MaxConn,
+		"fast mode for %s:%s%s (max_conn: %d, in-flight ceiling: %d)",
+		conf.Service.Name, conf.Service.Port, conf.Service.Path, conf.Service.MaxConn, fastModeLimit,
 	)
-	withReplyService(logTransaction, conf, upstream, ch, ctx, false)
+	withReplyService(logTransaction, conf, upstream, ch, ctx)
 }
 
 func ConsumerResponseSlow(
@@ -37,7 +58,7 @@ func ConsumerResponseSlow(
 		"slow mode for %s:%s%s (max_conn: %d)",
 		conf.Service.Name, conf.Service.Port, conf.Service.Path, conf.Service.MaxConn,
 	)
-	withReplyService(logTransaction, conf, upstream, ch, ctx, true)
+	withReplyService(logTransaction, conf, upstream, ch, ctx)
 }
 
 // DefaultDrainWindow is how long a stopping pipeline waits for in-flight upstream calls before
@@ -118,7 +139,7 @@ func sendToService(
 			return
 		}
 
-		wait := retryBackoff(attempt)
+		wait := RetryBackoff(attempt)
 		log.Warn().Str(consts.HeaderRequestIdKey, requestId).Int("attempt", attempt).
 			Dur("retry_in", wait).Err(err).Msg("upstream call failed, retrying")
 		timer := time.NewTimer(wait)
@@ -164,15 +185,17 @@ func recordFailure(msg *schemas.ConsumerEvent, err error) {
 	log.Error().Str(consts.HeaderRequestIdKey, msg.Values.RequestId).Msgf("error request to service: %v", err)
 }
 
-// withReplyService dispatches the events of ch to upstream (at most max_conn at once in slow mode).
-// On stop it waits for in-flight calls up to the drain window, then abandons the rest.
+// withReplyService dispatches the events of ch to upstream, at most one call
+// per semaphore slot at a time: service.max_conn slots in slow mode, the
+// built-in fast-mode ceiling otherwise. On stop it waits for in-flight calls up
+// to the drain window, then abandons the rest; a dispatch waiting for a free
+// slot returns immediately, so consumption stops without new calls.
 func withReplyService(
 	logTransaction schemas.TransactionLogger,
 	conf *schemas.ConsumerConfig,
 	upstream Upstream,
 	ch chan *schemas.ConsumerEvent,
 	ctx context.Context,
-	slowMode bool,
 ) {
 
 	timeout := conf.Service.Timeout
@@ -185,10 +208,8 @@ func withReplyService(
 		retry = &retryState{}
 	}
 
-	var sem chan struct{}
-	if slowMode {
-		sem = make(chan struct{}, conf.Service.MaxConn)
-	}
+	limit := concurrencyLimit(conf)
+	sem := make(chan struct{}, limit)
 
 	drain := conf.DrainWindow
 	if drain <= 0 {
@@ -222,25 +243,18 @@ func withReplyService(
 				RequestId: msgRequest.Values.RequestId,
 			}
 
-			if slowMode {
-				select {
-				case sem <- struct{}{}:
-					calls.Add(1)
-					go func(msg *schemas.ConsumerEvent) {
-						defer calls.Done()
-						defer func() { <-sem }()
-
-						sendToService(abandon, logTransaction, upstream, msg, timeout, retry)
-					}(msgRequest)
-				case <-ctx.Done():
-					return
-				}
-			} else {
+			select {
+			case sem <- struct{}{}:
 				calls.Add(1)
 				go func(msg *schemas.ConsumerEvent) {
 					defer calls.Done()
+					defer func() { <-sem }()
+
 					sendToService(abandon, logTransaction, upstream, msg, timeout, retry)
 				}(msgRequest)
+			case <-ctx.Done():
+				log.Info().Msg("context cancelled while waiting for a call slot, exiting withReplyService")
+				return
 			}
 		case <-ctx.Done():
 			log.Info().Msg("context cancelled, exiting withReplyService")

@@ -14,12 +14,12 @@ The Go module, the `cmd/` entrypoint directory, the binary, the Docker `APP_NAME
 
 ### Requirement: Legacy wire identifiers are frozen
 The following external identifiers MUST keep their legacy `controller-kafka` form until an explicit migration change replaces them:
-- HTTP headers `x-controller-kafka-produce-topic` and the custom prefix `x-controller-kafka-header-`;
+- HTTP headers `x-bridge-kafka-produce-topic` and the custom prefix `x-bridge-kafka-header-`;
 - metric names `controller_kafka_<event>_*`;
 - ALS `UpstreamCluster = "kafka-controller-cluster"` and fallback `ForwardedFor = "controller-kafka"`.
 
 #### Scenario: Caller built against the old name
-- **WHEN** a client publishes with `x-controller-kafka-produce-topic`
+- **WHEN** a client publishes with `x-bridge-kafka-produce-topic`
 - **THEN** the request is accepted exactly as before the rename
 
 ### Requirement: Tracking header names

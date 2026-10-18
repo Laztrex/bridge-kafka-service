@@ -247,6 +247,35 @@ func TestRunSubscription_SlowModeAndGroupCreationFailure(t *testing.T) {
 	<-done2
 }
 
+// A subscription that cannot start returns an error naming its topics, so the caller can treat
+// it as fatal; a subscription cancelled before it starts is a clean stop.
+func TestRunSubscription_StartFailuresReturnErrorsAndCleanStopReturnsNil(t *testing.T) {
+	_, host := upstream(t)
+
+	old := newConsumerGroup
+	newConsumerGroup = func(string, sarama.Client) (sarama.ConsumerGroup, error) { return nil, errors.New("no group") }
+	err := RunSubscription(context.Background(), nil, mocksarama.NewFakeClient(),
+		&schemas.ConsumerConfig{Topics: []string{"orders"}, Group: "g", Service: host}, newTestLogger(t))
+	newConsumerGroup = old
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "orders")
+	assert.ErrorContains(t, err, "cannot create consumer group")
+	assert.ErrorContains(t, err, "no group")
+
+	badTarget := schemas.HostConfig{Name: "%zz", Port: "1", Protocol: schemas.ProtocolGRPC}
+	err = RunSubscription(context.Background(), nil, mocksarama.NewFakeClient(),
+		&schemas.ConsumerConfig{Topics: []string{"payments"}, Group: "g", Service: badTarget}, newTestLogger(t))
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "payments")
+	assert.ErrorContains(t, err, "cannot create upstream")
+
+	useFakeGroup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.NoError(t, RunSubscription(ctx, nil, mocksarama.NewFakeClient(),
+		&schemas.ConsumerConfig{Topics: []string{"in"}, Group: "g", Service: host}, newTestLogger(t)))
+}
+
 func writeYAML(t *testing.T, content string) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "cfg.yaml")

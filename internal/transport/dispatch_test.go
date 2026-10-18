@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -224,7 +225,7 @@ func TestSlowModeCapsConcurrency(t *testing.T) {
 	assert.LessOrEqual(t, peak.Load(), int32(2))
 }
 
-func TestFastModeDispatchesWithoutCap(t *testing.T) {
+func TestFastModeBelowCeilingDispatchesAllConcurrently(t *testing.T) {
 	drainPublish()
 	release := make(chan struct{})
 	var started atomic.Int32
@@ -251,11 +252,178 @@ func TestFastModeDispatchesWithoutCap(t *testing.T) {
 	for started.Load() < 5 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	assert.Equal(t, int32(5), started.Load(), "fast mode must not cap concurrency")
+	assert.Equal(t, int32(5), started.Load(), "below the ceiling every record starts concurrently")
 
 	close(release)
 	close(ch)
 	<-done
+}
+
+func TestFastModeCeilingHoldsBackFurtherCalls(t *testing.T) {
+	drainPublish()
+	transport.FastModeLimit(t, 2)
+	release := make(chan struct{})
+	var started atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		started.Add(1)
+		<-release
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	conf := upstreamConf(t, srv, "")
+	ch := make(chan *schemas.ConsumerEvent, 10)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, ctxFrom(make(chan struct{})))
+	}()
+
+	for i := 0; i < 5; i++ {
+		e, _ := newEvent("")
+		ch <- e
+	}
+
+	// exactly the ceiling starts; the queued records wait for a slot
+	require.Eventually(t, func() bool { return started.Load() == 2 }, 3*time.Second, 10*time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, int32(2), started.Load(), "no call above the ceiling is in flight")
+
+	release <- struct{}{} // one slot frees
+	require.Eventually(t, func() bool { return started.Load() == 3 }, 3*time.Second, 10*time.Millisecond,
+		"the next record starts only after a call finishes")
+
+	close(release)
+	close(ch)
+	<-done
+	assert.Equal(t, int32(5), started.Load(), "every queued record is dispatched in the end")
+}
+
+func TestFastModeShutdownAtCeilingLeavesWaitingRecordUnsettled(t *testing.T) {
+	drainPublish()
+	transport.FastModeLimit(t, 1)
+	block := make(chan struct{})
+	var started atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		started.Add(1)
+		<-block
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	conf := upstreamConf(t, srv, "")
+	ch := make(chan *schemas.ConsumerEvent, 4)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, ctxFrom(stop))
+	}()
+
+	flying, _ := newEvent("")
+	ch <- flying // takes the only slot and blocks in the upstream
+	waiting, waitingAcks := newEvent("")
+	waiting.SetAck(func() { *waitingAcks++ })
+	ch <- waiting // waits for a slot
+
+	require.Eventually(t, func() bool { return started.Load() == 1 }, 3*time.Second, 10*time.Millisecond)
+	close(stop)  // shutdown while the semaphore is full and a record waits
+	close(block) // let the in-flight call finish so the drain completes
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("a dispatch waiting for the ceiling must return immediately on shutdown")
+	}
+	assert.Zero(t, *waitingAcks, "the waiting record is not settled and will be redelivered")
+	drainPublish()
+}
+
+// newConnCountingServer returns an httptest server that counts accepted
+// connections (StateNew), started before it accepts anything.
+func newConnCountingServer(t *testing.T, newConns *atomic.Int32) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			newConns.Add(1)
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// runPipelines sends total events through a dispatcher and waits for their acks.
+func runPipelines(t *testing.T, conf *schemas.ConsumerConfig, total int, slowMode bool) {
+	t.Helper()
+	ch := make(chan *schemas.ConsumerEvent, total+1)
+	acked := make(chan struct{}, total+1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if slowMode {
+			transport.ConsumerResponseSlow(logger(t), conf, transport.NewHTTPUpstream(conf), ch, ctxFrom(make(chan struct{})))
+		} else {
+			transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, ctxFrom(make(chan struct{})))
+		}
+	}()
+
+	for range total {
+		e, _ := newEvent("")
+		e.SetAck(func() { acked <- struct{}{} })
+		ch <- e
+	}
+	for range total {
+		select {
+		case <-acked:
+		case <-time.After(10 * time.Second):
+			t.Fatal("not all calls finished")
+		}
+	}
+	close(ch)
+	<-done
+}
+
+func TestHTTPUpstreamReusesConnections_SlowMode(t *testing.T) {
+	drainPublish()
+	var newConns atomic.Int32
+	srv := newConnCountingServer(t, &newConns)
+
+	conf := upstreamConf(t, srv, "")
+	conf.Service.MaxConn = 8
+
+	runPipelines(t, conf, 200, true)
+
+	// The pool must reuse connections: 200 calls through a pool sized to the
+	// limit open far fewer connections than calls. The bound is the limit plus
+	// slack, not the exact limit: with MaxConnsPerHost = 0 (design D3, the
+	// semaphore is the only cap) net/http briefly dials a new connection when
+	// a request starts exactly while a finished connection is still returning
+	// to the idle pool. Without a per-host pool the 200 calls would open ~200
+	// connections (http.DefaultTransport keeps only 2 idle per host).
+	assert.Positive(t, newConns.Load(), "the run must have opened at least one connection")
+	assert.LessOrEqual(t, newConns.Load(), int32(16),
+		"a steady 8-way concurrency must reuse a bounded pool of connections")
+}
+
+func TestHTTPUpstreamReusesConnections_FastModeCeiling(t *testing.T) {
+	drainPublish()
+	transport.FastModeLimit(t, 4)
+	var newConns atomic.Int32
+	srv := newConnCountingServer(t, &newConns)
+
+	conf := upstreamConf(t, srv, "")
+
+	runPipelines(t, conf, 200, false)
+
+	// Same overshoot reasoning as the slow-mode variant: the bound is the
+	// ceiling plus slack, proving reuse rather than an exact connection count.
+	assert.Positive(t, newConns.Load(), "the run must have opened at least one connection")
+	assert.LessOrEqual(t, newConns.Load(), int32(8),
+		"a fast-mode pipeline must reuse a bounded pool of connections")
 }
 
 func TestDispatcherStopsOnContextCancel(t *testing.T) {

@@ -18,6 +18,10 @@ type TransactionLogger interface {
 	CloseAudit(*accesslog.StreamAccessLogsMessage)
 	Start(*Event)
 	Publish(sarama.SyncProducer, string, *ContextValues, *Event, http.ResponseWriter)
+	// RecordPublishOutcome records the single outcome of a publication on event
+	// and emits its egress audit entry; publication retries call Send per
+	// attempt and this exactly once (see FileTransactionLogger.RecordPublishOutcome).
+	RecordPublishOutcome(*ContextValues, *Event, time.Time, error)
 	CloseAll()
 }
 

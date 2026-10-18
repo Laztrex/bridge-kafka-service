@@ -2,7 +2,7 @@
 
 ## Why
 
-`on_failure: retry` promises that a response is never dropped (README, "Service failures"), but the last step of the pipeline does not keep that promise. When writing the response to `response_topic` fails, the response publisher records a failure and still settles the offset, so the record is lost. When the shared producer cannot be created within the retry window, consumers start anyway: every record is sent to the upstream (a side effect), its response is discarded as "no producer" and its offset is committed. A stanza can also name a `response_topic` that no producer serves, which loses every response the same way. The archived change `2026-10-14-upstream-failure-retry` left producer errors out of scope on purpose. This change closes that gap.
+`on_failure: retry` promises that a response is never dropped (README, "Service failures"), but the last step of the pipeline does not keep that promise. When writing the response to `response_topic` fails, the response publisher records a failure and still settles the offset, so the record is lost. When the shared producer cannot be created within the retry window, consumers start anyway: every record is sent to the upstream (a side effect), its response is discarded as "no producer" and its offset is committed. A stanza can also name a `response_topic` that no producer serves, which loses every response the same way. The upstream retry behaviour left producer errors out of scope on purpose; this change closes that gap.
 
 ## What Changes
 

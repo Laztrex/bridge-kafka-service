@@ -51,7 +51,9 @@ func NewHandlers(
 // responses to their response topics. It is independent of the HTTP publish
 // endpoint and must run whenever consumers are active, even with no producers
 // configured (events are then failed and settled instead of piling up).
-// When ctx is cancelled it publishes what is already queued and returns.
+// Responses of on_failure: retry stanzas are retried with backoff until they
+// are written (design D1); after ctx is cancelled the drain gives every queued
+// event a single attempt, so no new waits are added on shutdown.
 func ResponsePublish(
 	ctx context.Context,
 	logTransaction schemas.TransactionLogger,
@@ -60,12 +62,12 @@ func ResponsePublish(
 	for {
 		select {
 		case msg := <-transport.PublishChannel:
-			publishOne(logTransaction, producers, msg)
+			publishOne(ctx, logTransaction, producers, msg)
 		case <-ctx.Done():
 			for {
 				select {
 				case msg := <-transport.PublishChannel:
-					publishOne(logTransaction, producers, msg)
+					publishOne(ctx, logTransaction, producers, msg)
 				default:
 					return
 				}
@@ -74,10 +76,15 @@ func ResponsePublish(
 	}
 }
 
-func publishOne(logTransaction schemas.TransactionLogger, producers ProducerLookup, msg *schemas.ConsumerEvent) {
+func publishOne(ctx context.Context, logTransaction schemas.TransactionLogger, producers ProducerLookup, msg *schemas.ConsumerEvent) {
 	msg.Event = &schemas.Event{
 		EventType: consts.EventResponseService,
 		RequestId: msg.Values.RequestId,
+	}
+
+	if msg.Config != nil && msg.Config.EffectiveFailurePolicy() == schemas.FailureRetry {
+		publishOneRetrying(ctx, logTransaction, producers, msg)
+		return
 	}
 
 	logTransaction.Start(msg.Event)

@@ -9,8 +9,8 @@ import (
 // Retry timing for on_failure: retry. Fixed in code on purpose (the setting is a
 // single word); variables only so that tests can shrink them.
 var (
-	retryBackoffStart = time.Second
-	retryBackoffMax   = 30 * time.Second
+	RetryBackoffStart = time.Second
+	RetryBackoffMax   = 30 * time.Second
 	// poisonAttempts is how many failed attempts a record gets before it may be
 	// skipped as poison (only while other calls of the pipeline succeed).
 	poisonAttempts = 5
@@ -20,14 +20,15 @@ var (
 // hit a recovering service in lockstep.
 const retryBackoffJitter = 0.2
 
-// retryBackoff is the wait after failed attempt n (1-based): the start value
-// doubled per attempt, capped, then jittered.
-func retryBackoff(attempt int) time.Duration {
-	d := retryBackoffStart
-	for i := 1; i < attempt && d < retryBackoffMax; i++ {
+// RetryBackoff is the wait after failed attempt n (1-based): the start value
+// doubled per attempt, capped, then jittered. It is shared by the upstream
+// retry and the response-publication retry, so both back off identically.
+func RetryBackoff(attempt int) time.Duration {
+	d := RetryBackoffStart
+	for i := 1; i < attempt && d < RetryBackoffMax; i++ {
 		d *= 2
 	}
-	d = min(d, retryBackoffMax)
+	d = min(d, RetryBackoffMax)
 	return time.Duration(float64(d) * (1 + retryBackoffJitter*(2*rand.Float64()-1)))
 }
 

@@ -211,7 +211,7 @@ Project conventions shared with other Go services: [docs/conventions.md](docs/co
 
 * *Health checks*: a built-in health endpoint
 
-* *Connection pool*: a configurable connection limit for the slow mode
+* *Connection pool*: a per-pipeline connection limit (`max_conn` in slow mode, a built-in 512-call ceiling in fast mode) with connection reuse
 
 ### Components
 #### Consumer:
@@ -268,7 +268,7 @@ timeouts.shutdown: 10s                  # on SIGTERM: drain of HTTP requests and
 
 kafka:
   brokers: kafka:29092,kafka2:29093     # a comma-separated string or a list
-  version: 2.3.0
+  version: 2.3.0                        # with consumers: at least 0.10.2 (0.x written as 0.10.2.0), else startup fails
 kafka.tls.client.cert.path: certs/client_cert.pem
 kafka.tls.client.key.path: certs/client_key.pem
 kafka.tls.ca.path: certs/cacert.pem
@@ -293,7 +293,7 @@ consumer:
         server_name: ""
         skip_verify: false
     response_topic: bridge.responses.1        # must be listed under producer
-    on_failure: skip                    # skip (default) | retry; retry requires max_conn > 0
+    on_failure: skip                    # skip (default) | retry; retry requires max_conn > 0 and response_topic to be a producer topic
 
 producer:
   - topic: bridge.publish.out
@@ -330,7 +330,7 @@ Each consumer has:
 
 * name: service name
 
-* port: service port
+* port: service port (`protocol: grpc`: a number from 1 to 65535, otherwise startup fails)
 
 * path: API path (`protocol: http` only)
 
@@ -338,13 +338,13 @@ Each consumer has:
 
 * tls: encryption of the service connection (see below), **off** by default
 
-* max_conn: maximum number of connections (0 = unlimited)
+* max_conn: maximum number of connections (`0` = fast mode, at most 512 concurrent calls; a negative value also selects fast mode)
 
 * timeout: service call timeout, seconds (`30`) or a duration (`"10s"`); default 30 seconds
 
 * response_topic: topic the service response is published to (without it the response is not published)
 
-* on_failure: what to do when the service cannot be reached: `skip` (default) or `retry` (see below)
+* on_failure: what to do when the service cannot be reached: `skip` (default) or `retry` (see below). With `retry`, a non-empty `response_topic` must be listed as a `producer:` topic: startup fails otherwise, because such a config would lose every response.
 
 ### Service transport: HTTP or gRPC
 `service.protocol` selects how a record reaches the service. Everything else (timeout, offset settle, `x-request-id`/`x-client-id` propagation, response publishing, metrics, `max_conn` modes) is **identical** for both protocols.
@@ -397,7 +397,7 @@ A failure is only a transport failure: the service is unreachable, does not answ
 
 `retry` requires `service.max_conn > 0`, otherwise startup fails. When all `max_conn` slots are retrying, the pipeline stops reading Kafka until the service recovers, so an outage loses nothing. Each failed attempt is logged as a warning; metrics count only the final outcome of a record.
 
-With `retry` a response is never dropped either: when the internal publish queue (1000 responses) is full because Kafka writes are slow, the call waits for space instead of dropping the response and settling the offset (`skip` drops it with a warning). On shutdown such a wait ends after `timeouts.shutdown`, and the record is redelivered.
+With `retry` a response is never dropped either: when the internal publish queue (1000 responses) is full because Kafka writes are slow, the call waits for space instead of dropping the response and settling the offset (`skip` drops it with a warning). And when Kafka rejects the write itself, the response is republished with the same backoff (1s doubling up to 30s) until the broker accepts it: the offset is held and the upstream is not called again, so a broker outage stalls `retry` pipelines instead of losing their responses. Each failed attempt is logged as a warning; metrics and audit record only the final outcome. The exception is a non-transient publish error (for example, a record too large for the broker): it is recorded as a failure and the offset is settled, like a poison record. On shutdown the backoff wait ends and an unpublished response is not settled, so its record is redelivered after restart.
 
 A record that fails 5 attempts **while other records of the same pipeline get answers** is treated as poison: a failure metric, a `poison` warning with its request id, the offset is settled. During an outage nothing is skipped. With `max_conn: 1` there are no other calls to compare with, so such a record is retried until the service answers.
 
@@ -520,7 +520,8 @@ template:
 ### Startup, shutdown and signals
 
 * **The HTTP server and `/health` start immediately**, without waiting for Kafka. The producer and consumers connect in the background with exponential backoff (up to 5 minutes). Until the producer connects, `POST /api/v1/publish` returns `503`; consumers start reading only once the producer is ready or permanently unavailable.
-* If a consumer client cannot be created within 5 minutes, the process **exits with code 1** (so the orchestrator restarts it) instead of idling.
+* If a consumer client cannot be created within 5 minutes, the process **exits with code 1** (so the orchestrator restarts it) instead of idling. The same happens when the producer cannot be created within 5 minutes **and at least one consumer stanza has a `response_topic`**: no consumer reads a record whose response could not be published. A deployment where no stanza has a `response_topic` keeps running with consumption only, as before.
+* If a subscription cannot start after its client was created (the service connection cannot be set up, the consumer group cannot be created), the process also **exits with code 1**, and the error names the stanza's topics; it never keeps running while reporting ready without reading. The configuration causes of this are rejected at startup instead: `kafka.version` below 0.10.2 with active consumers, an invalid `service.name`/`service.port` of a gRPC stanza.
 * `SIGTERM` / `SIGINT`: graceful shutdown. HTTP intake and Kafka reading stop, the metrics and audit queues are flushed, the producer and files are closed. Records not processed in time are not committed and will be redelivered (at-least-once).
 * `SIGUSR1` toggles pause/resume of reading **for all** consumers of the process.
 
@@ -589,7 +590,7 @@ POST /api/v1/publish
 ~~~
 Headers:
 ~~~
-x-controller-kafka-produce-topic: target topic (required)
+x-bridge-kafka-produce-topic: target topic (required)
 
 x-request-id: request id (optional, generated otherwise)
 
@@ -597,7 +598,7 @@ x-request-time: timestamp (optional)
 
 x-kafka-key: partitioning key (optional)
 
-x-controller-kafka-header-<name>: becomes Kafka header <Name> (the prefix is dropped)
+x-bridge-kafka-header-<name>: becomes Kafka header <Name> (the prefix is dropped)
 ~~~
 Response codes: `422` missing topic header / invalid body (including more than one JSON value), `415` Content-Type is not `application/json`, `503` the producer is not configured or not connected yet.
 
@@ -631,11 +632,11 @@ curl -s http://localhost:8081/health
 
 # publish to Kafka (the topic from the header must be listed under producer)
 curl -i -X POST http://localhost:8081/api/v1/publish \
-  -H 'x-controller-kafka-produce-topic: bridge.publish.out' \
+  -H 'x-bridge-kafka-produce-topic: bridge.publish.out' \
   -H 'Content-Type: application/json' \
   -H 'x-request-id: demo-001' \
   -H 'x-kafka-key: user-42' \
-  -H 'x-controller-kafka-header-tenant: acme' \
+  -H 'x-bridge-kafka-header-tenant: acme' \
   -d '{"params":[5,10]}'
 ~~~
 Response:
@@ -650,7 +651,7 @@ X-Trace-Id: demo-001
 
 {"result":"success"}
 ~~~
-Topic `bridge.publish.out` receives a record with **value** `{"params":[5,10]}`, **key** `user-42` (from `x-kafka-key`) and **headers** `x-request-id`, `x-request-time`, `x-trace-id`, `x-kafka-key` and `Tenant: acme` (the `x-controller-kafka-header-` prefix is dropped; the name arrives canonicalized by `net/http`). Without `x-request-id` the bridge generates a UUID and returns it in `X-Request-Id`.
+Topic `bridge.publish.out` receives a record with **value** `{"params":[5,10]}`, **key** `user-42` (from `x-kafka-key`) and **headers** `x-request-id`, `x-request-time`, `x-trace-id`, `x-kafka-key` and `Tenant: acme` (the `x-bridge-kafka-header-` prefix is dropped; the name arrives canonicalized by `net/http`). Without `x-request-id` the bridge generates a UUID and returns it in `X-Request-Id`.
 
 Read it back:
 ~~~bash
@@ -661,18 +662,18 @@ docker compose exec kafka kafka-console-consumer --bootstrap-server kafka:29092 
 
 **Errors** (bodies and codes as in real responses):
 
-| Situation | Code | Body |
-|---|---|---|
-| no `x-controller-kafka-produce-topic` header | 422 | `{"result":{},"status":"failure","detail":"RequestHeader not contains header 'x-controller-kafka-produce-topic'"}` |
-| empty body | 422 | `{"result":{},"status":"failure","detail":"RequestBody body must not be empty"}` |
-| invalid JSON | 422 | `{"result":{},"status":"failure","detail":"RequestBody body contains badly-formed JSON"}` |
-| several JSON values in the body | 422 | `RequestBody body must only contain a single JSON object` (text/plain) |
-| body over 2 MB | 422 | `{"result":{},"status":"failure","detail":"RequestBody body must not be larger than 2MB"}` |
-| `Content-Type` is not `application/json` | 415 | `Content-Type header is not application/json` (text/plain) |
-| topic not configured as a producer | **200** | `{"result":"failure: no producer"}` (kept for compatibility) |
-| method is not `POST` | 405 | `Method Not Allowed` + `Allow: POST` |
-| producer not connected yet | 503 | `Publish functionality is not ready: Kafka producer is not connected` |
-| no producers in the config | 503 | `Publish functionality is disabled: no Kafka producers configured` |
+| Situation                                | Code | Body                                                                                                           |
+|------------------------------------------|---|----------------------------------------------------------------------------------------------------------------|
+| no `x-bridge-kafka-produce-topic` header | 422 | `{"result":{},"status":"failure","detail":"RequestHeader not contains header 'x-bridge-kafka-produce-topic'"}` |
+| empty body                               | 422 | `{"result":{},"status":"failure","detail":"RequestBody body must not be empty"}`                               |
+| invalid JSON                             | 422 | `{"result":{},"status":"failure","detail":"RequestBody body contains badly-formed JSON"}`                      |
+| several JSON values in the body          | 422 | `RequestBody body must only contain a single JSON object` (text/plain)                                         |
+| body over 2 MB                           | 422 | `{"result":{},"status":"failure","detail":"RequestBody body must not be larger than 2MB"}`                     |
+| `Content-Type` is not `application/json` | 415 | `Content-Type header is not application/json` (text/plain)                                                     |
+| topic not configured as a producer       | **200** | `{"result":"failure: no producer"}` (kept for compatibility)                                                   |
+| method is not `POST`                     | 405 | `Method Not Allowed` + `Allow: POST`                                                                           |
+| producer not connected yet               | 503 | `Publish functionality is not ready: Kafka producer is not connected`                                          |
+| no producers in the config               | 503 | `Publish functionality is disabled: no Kafka producers configured`                                             |
 
 Every response except 405/503 returns `X-Request-Id`, `X-Trace-Id` and `X-Request-Time`.
 
@@ -763,7 +764,7 @@ Common problems:
 
 * Connection timeouts: check network connectivity to the Kafka brokers
 
-* Memory usage: monitor the number of concurrent service requests (unbounded in fast mode; set `service.max_conn`)
+* Memory usage: monitor the number of concurrent service requests (capped at 512 per fast-mode pipeline; set `service.max_conn` for a lower limit)
 
 * Profiling: enabled only by `pprof.addr` in the config (a separate port; keep it on 127.0.0.1)
 

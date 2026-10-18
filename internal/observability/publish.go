@@ -3,6 +3,7 @@ package observability
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/IBM/sarama"
 	"github.com/rs/zerolog/log"
@@ -16,7 +17,7 @@ import (
 // Publish sends a record to topic, records the outcome on event, emits the ALS
 // egress audit entry and, when w is non-nil, writes the HTTP API reply. It
 // serves both the HTTP publish endpoint (w set) and the response publisher
-// (w nil).
+// (w nil) with a single attempt.
 func (l *FileTransactionLogger) Publish(
 	producer sarama.SyncProducer,
 	topic string,
@@ -26,15 +27,34 @@ func (l *FileTransactionLogger) Publish(
 ) {
 	start := l.now()
 	defer l.Close(event)
-	var msg string
 
 	err := Send(producer, topic, query.Body, query.RequestId)
+	l.RecordPublishOutcome(query, event, start, err)
+
+	if w != nil {
+		msg := "failure"
+		if err == nil {
+			msg = "success"
+		}
+		transport.ProduceResponse(msg, w)
+	}
+}
+
+// RecordPublishOutcome records the single outcome of a publication on event
+// (success or failure, by err) and emits the egress ALS audit entry measured
+// from start. A publisher that retries its sends calls Send per attempt and
+// this exactly once, so metrics and audit describe the whole publication, not
+// each attempt.
+func (l *FileTransactionLogger) RecordPublishOutcome(
+	query *schemas.ContextValues,
+	event *schemas.Event,
+	start time.Time,
+	err error,
+) {
 	if err != nil {
 		event.SetFailure(query.RequestId)
-		msg = "failure"
 	} else {
 		event.SetSuccess(query.RequestId)
-		msg = "success"
 	}
 
 	LogAuditEventWithLatency(
@@ -46,10 +66,6 @@ func (l *FileTransactionLogger) Publish(
 		query.Path,
 		start,
 	)
-
-	if w != nil {
-		transport.ProduceResponse(msg, w)
-	}
 }
 
 // Send marshals a request body to JSON and dispatches it via the supplied

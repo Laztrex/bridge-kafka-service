@@ -155,6 +155,87 @@ func TestPrepareUpstreamsFailurePolicy(t *testing.T) {
 	}
 }
 
+// An active gRPC stanza needs a host:port target the gRPC client can parse; HTTP stanzas and
+// stanzas without topics are not checked.
+func TestPrepareUpstreamsGRPCTarget(t *testing.T) {
+	cases := []struct {
+		name     string
+		protocol string
+		host     string
+		port     string
+		topics   []string
+		want     []string
+	}{
+		{"valid", "grpc", "model-svc", "50051", []string{"orders"}, nil},
+		{"empty port", "grpc", "model-svc", "", []string{"orders"}, []string{"consumer #1", "orders", "service.port"}},
+		{"non-numeric port", "grpc", "model-svc", "abc", []string{"orders"}, []string{`"abc"`}},
+		{"zero port", "grpc", "model-svc", "0", []string{"orders"}, []string{`"0"`}},
+		{"port out of range", "grpc", "model-svc", "70000", []string{"orders"}, []string{`"70000"`}},
+		{"signed port", "grpc", "model-svc", "+80", []string{"orders"}, []string{`"+80"`}},
+		{"host with space", "grpc", "model svc", "50051", []string{"orders"}, []string{"service.name"}},
+		{"http not checked", "http", "svc", "abc", []string{"orders"}, nil},
+		{"inactive not checked", "grpc", "", "", nil, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cc := &schemas.ConsumerConfig{Topics: c.topics, Service: schemas.HostConfig{Protocol: c.protocol, Name: c.host, Port: c.port}}
+			err := PrepareUpstreams(&schemas.KafkaInfo{Consumers: []*schemas.ConsumerConfig{cc}})
+			if len(c.want) == 0 {
+				if err != nil {
+					t.Fatalf("valid config rejected: %v", err)
+				}
+				return
+			}
+			for _, want := range c.want {
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %v must contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// A retry stanza names a response_topic that no producer serves: such a config
+// would lose every response, so startup must fail and name both.
+func TestPrepareUpstreamsRetryResponseTopicMustBeProduced(t *testing.T) {
+	cases := []struct {
+		name          string
+		policy        string
+		responseTopic string
+		producers     []*schemas.ProducerConfig
+		want          []string
+	}{
+		{"retry with unlisted response topic", "retry", "orders.out", nil,
+			[]string{"consumer #1", "orders", `"orders.out"`, "producer topic"}},
+		{"retry with listed response topic", "retry", "orders.out",
+			[]*schemas.ProducerConfig{{Topic: "orders.out"}}, nil},
+		{"retry without response topic", "retry", "", nil, nil},
+		{"skip with unlisted response topic", "skip", "orders.out", nil, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cc := &schemas.ConsumerConfig{
+				Topics:        []string{"orders"},
+				OnFailure:     c.policy,
+				ResponseTopic: c.responseTopic,
+				Service:       schemas.HostConfig{MaxConn: 2},
+			}
+			err := PrepareUpstreams(&schemas.KafkaInfo{Consumers: []*schemas.ConsumerConfig{cc}, Producers: c.producers})
+			if len(c.want) == 0 {
+				if err != nil {
+					t.Fatalf("valid config rejected: %v", err)
+				}
+				return
+			}
+			for _, want := range c.want {
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %v must contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
 // Kafka broker TLS keeps its historical behaviour: broken material degrades to an insecure
 // connection with a warning instead of stopping startup.
 func TestNewKafkaTLS(t *testing.T) {

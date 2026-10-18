@@ -72,15 +72,22 @@ func TestPublishHandler_UnknownTopic(t *testing.T) {
 }
 
 func TestResponsePublish_PublishesAndAcks(t *testing.T) {
+	drainPublishChannel()
 	producer := mocksarama.NewSyncProducer(t)
 	mocksarama.ExpectSendAndSucceed(producer)
 	reg := router.NewProducerRegistry()
 	reg.Set(producer, []string{"resp"})
 
-	acked := make(chan struct{}, 2)
-	ev := func(topic string) *schemas.ConsumerEvent {
+	skipConf := &schemas.ConsumerConfig{OnFailure: schemas.FailureSkip}
+	retryConf := &schemas.ConsumerConfig{
+		OnFailure: schemas.FailureRetry,
+		Service:   schemas.HostConfig{MaxConn: 1},
+	}
+	acked := make(chan struct{}, 3)
+	ev := func(topic string, conf *schemas.ConsumerConfig) *schemas.ConsumerEvent {
 		e := &schemas.ConsumerEvent{
 			ResponseTopic: topic,
+			Config:        conf,
 			Values: &schemas.ContextValues{
 				RequestId: "r1",
 				Body:      &schemas.RequestBody{Data: []byte(`{}`), Headers: map[string]string{}},
@@ -94,16 +101,21 @@ func TestResponsePublish_PublishesAndAcks(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); ResponsePublish(ctx, newLogger(t), reg) }()
 
-	transport.PublishChannel <- ev("resp")
-	transport.PublishChannel <- ev("missing")
+	transport.PublishChannel <- ev("resp", skipConf)
+	transport.PublishChannel <- ev("missing", skipConf) // no producer, skip: failed and settled
+	fallback := ev("missing", retryConf)                // no producer, retry: defensive fallback
+	transport.PublishChannel <- fallback
 
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 3; i++ {
 		select {
 		case <-acked:
 		case <-time.After(3 * time.Second):
 			t.Fatalf("event %d was not settled", i)
 		}
 	}
+
+	assert.Equal(t, 1, fallback.Event.Failure, "a retry event without a producer is settled as a failure")
+	assert.Zero(t, fallback.Event.Success)
 
 	cancel()
 	select {

@@ -42,19 +42,23 @@ type Consumer struct {
 // RunSubscription runs the consume loop and the response handler of one subscription until
 // parent is cancelled or consumption ends. Each value on toggle flips pause/resume. On stop,
 // consumption is cancelled before the event channel is closed, since ConsumeClaim may still send.
+// A non-nil return means a permanent inability to start consuming (the upstream cannot be
+// constructed, the consumer group cannot be created): the error names the stanza's topics and
+// the caller treats it as fatal. Every clean stop (context cancelled, group closed, normal
+// end) returns nil; transient consume-loop errors keep their 5-second retry.
 func RunSubscription(
 	parent context.Context,
 	toggle <-chan struct{},
 	consumerClient sarama.Client,
 	consumerConfig *schemas.ConsumerConfig,
 	logger *observability.FileTransactionLogger,
-) {
+) error {
 	consumptionIsPaused := false
 
 	upstream, err := transport.NewUpstream(consumerConfig)
 	if err != nil {
 		log.Error().Msgf("cannot create upstream for topics %v: %v", consumerConfig.Topics, err)
-		return
+		return fmt.Errorf("subscription for topics %v: cannot create upstream: %w", consumerConfig.Topics, err)
 	}
 	if closer, ok := upstream.(io.Closer); ok {
 		defer func() { _ = closer.Close() }()
@@ -73,7 +77,7 @@ func RunSubscription(
 	client, err := newConsumerGroup(consumerConfig.Group, consumerClient)
 	if err != nil {
 		log.Error().Msgf("error creating consumer group client: %v", err)
-		return
+		return fmt.Errorf("subscription for topics %v: cannot create consumer group: %w", consumerConfig.Topics, err)
 	}
 	defer func() {
 		if err := client.Close(); err != nil {
@@ -156,6 +160,7 @@ func RunSubscription(
 	wg.Wait()
 
 	log.Info().Msg("consumer fully terminated")
+	return nil
 }
 
 func toggleConsumptionFlow(client sarama.ConsumerGroup, isPaused *bool) {

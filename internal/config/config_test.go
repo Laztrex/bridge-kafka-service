@@ -36,6 +36,34 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+// Consumer groups need Kafka 0.10.2; only a parseable older version with active consumers is fatal.
+func TestValidateKafkaVersion(t *testing.T) {
+	consumer := &schemas.ConsumerConfig{Topics: []string{"t"}, Group: "g", Service: schemas.HostConfig{Name: "svc"}}
+	producer := &schemas.ProducerConfig{Topic: "o"}
+	cases := []struct {
+		name    string
+		cfg     *schemas.KafkaInfo
+		wantErr bool
+	}{
+		{"too old", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "0.10.1.0", Consumers: []*schemas.ConsumerConfig{consumer}}, true},
+		{"too old with producer", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "0.10.1.0", Consumers: []*schemas.ConsumerConfig{consumer}, Producers: []*schemas.ProducerConfig{producer}}, true},
+		{"minimum", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "0.10.2.0", Consumers: []*schemas.ConsumerConfig{consumer}}, false},
+		{"unparseable keeps fallback", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "latest", Consumers: []*schemas.ConsumerConfig{consumer}}, false},
+		{"producer only", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "0.10.1.0", Producers: []*schemas.ProducerConfig{producer}}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := Validate(c.cfg)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("Validate() = %v, wantErr %v", err, c.wantErr)
+			}
+			if err != nil && (!strings.Contains(err.Error(), `"0.10.1.0"`) || !strings.Contains(err.Error(), "0.10.2")) {
+				t.Fatalf("error %v must name the version and the minimum", err)
+			}
+		})
+	}
+}
+
 func TestLoadAppliesDefaults(t *testing.T) {
 	cfg := mustLoad(t, "kafka:\n  brokers: b:9092\nconsumer:\n  - topics: t\n    group: g\n    service:\n      name: svc\nproducer:\n  - topic: out\n", nil)
 

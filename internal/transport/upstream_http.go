@@ -20,17 +20,21 @@ type httpUpstream struct {
 }
 
 // NewHTTPUpstream returns the HTTP Upstream: a JSON POST to the service address (https with TLS),
-// bounded by the call's context rather than a client timeout.
+// bounded by the call's context rather than a client timeout. It uses its own
+// connection pool (a clone of http.DefaultTransport) sized to the pipeline's
+// concurrency limit, so concurrent calls reuse connections instead of
+// reconnecting, and pipelines never share a pool.
 func NewHTTPUpstream(conf *schemas.ConsumerConfig) Upstream {
-	base := http.DefaultTransport
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	limit := concurrencyLimit(conf)
+	t.MaxIdleConns = limit
+	t.MaxIdleConnsPerHost = limit
 	if conf.UpstreamTLS != nil {
-		t := http.DefaultTransport.(*http.Transport).Clone()
 		t.TLSClientConfig = conf.UpstreamTLS.Clone()
-		base = t
 	}
 	return &httpUpstream{
 		uri:    conf.Service.URI(),
-		client: &http.Client{Transport: middlewares.LoggerTransportRoundTripper{Proxy: base}},
+		client: &http.Client{Transport: middlewares.LoggerTransportRoundTripper{Proxy: t}},
 	}
 }
 

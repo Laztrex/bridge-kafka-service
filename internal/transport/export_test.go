@@ -27,15 +27,24 @@ func SendToServiceRetrying(
 
 func (r *retryState) Succeeded() { r.succeeded() }
 
-var RetryBackoff = retryBackoff
-
 // FastRetries shrinks the retry timing for one test.
 func FastRetries(t testing.TB, start, max time.Duration) {
 	t.Helper()
-	oldStart, oldMax := retryBackoffStart, retryBackoffMax
-	retryBackoffStart, retryBackoffMax = start, max
-	t.Cleanup(func() { retryBackoffStart, retryBackoffMax = oldStart, oldMax })
+	oldStart, oldMax := RetryBackoffStart, RetryBackoffMax
+	RetryBackoffStart, RetryBackoffMax = start, max
+	t.Cleanup(func() { RetryBackoffStart, RetryBackoffMax = oldStart, oldMax })
 }
+
+// FastModeLimit lowers the effective fast-mode in-flight ceiling for one test.
+func FastModeLimit(t testing.TB, limit int) {
+	t.Helper()
+	old := fastModeLimit
+	fastModeLimit = limit
+	t.Cleanup(func() { fastModeLimit = old })
+}
+
+// ConcurrencyLimit exposes the pipeline limit rule to the external tests.
+var ConcurrencyLimit = concurrencyLimit
 
 // PoisonAttempts is the number of failed attempts before a record may be skipped.
 func PoisonAttempts() int { return poisonAttempts }

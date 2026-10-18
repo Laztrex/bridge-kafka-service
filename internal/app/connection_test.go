@@ -3,11 +3,13 @@ package app
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -112,7 +114,7 @@ func TestStartProducerRegistersEveryTopic(t *testing.T) {
 	t.Cleanup(func() { newProducerWithRetry = old })
 	reg := router.NewProducerRegistry()
 
-	startProducer(context.Background(), &schemas.KafkaInfo{Producers: []*schemas.ProducerConfig{{Topic: "a"}, {Topic: "b"}}}, reg)
+	require.NoError(t, startProducer(context.Background(), &schemas.KafkaInfo{Producers: []*schemas.ProducerConfig{{Topic: "a"}, {Topic: "b"}}}, reg))
 
 	for _, topic := range []string{"a", "b"} {
 		got, ok := reg.Lookup(topic)
@@ -121,21 +123,24 @@ func TestStartProducerRegistersEveryTopic(t *testing.T) {
 	}
 }
 
-func TestStartProducerLeavesRegistryEmptyWhenUnavailableOrUnconfigured(t *testing.T) {
+func TestStartProducerReturnsItsErrorAndRegistersNothing(t *testing.T) {
 	reg := router.NewProducerRegistry()
-	startProducer(context.Background(), &schemas.KafkaInfo{}, reg)
+
+	require.NoError(t, startProducer(context.Background(), &schemas.KafkaInfo{}, reg), "no producers: nothing to fail")
 	assert.False(t, reg.Ready())
 
 	old := newProducerWithRetry
 	newProducerWithRetry = func(context.Context, *schemas.KafkaInfo) (sarama.SyncProducer, error) { return nil, errors.New("down") }
 	t.Cleanup(func() { newProducerWithRetry = old })
 
-	startProducer(context.Background(), &schemas.KafkaInfo{Producers: []*schemas.ProducerConfig{{Topic: "a"}}}, reg)
+	err := startProducer(context.Background(), &schemas.KafkaInfo{Producers: []*schemas.ProducerConfig{{Topic: "a"}}}, reg)
+	require.Error(t, err)
 	assert.False(t, reg.Ready(), "a permanent failure registers nothing")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	startProducer(ctx, &schemas.KafkaInfo{Producers: []*schemas.ProducerConfig{{Topic: "a"}}}, reg)
+	assert.Error(t, startProducer(ctx, &schemas.KafkaInfo{Producers: []*schemas.ProducerConfig{{Topic: "a"}}}, reg),
+		"a cancelled window is still an error; the caller checks ctx")
 	assert.False(t, reg.Ready())
 }
 
@@ -246,6 +251,77 @@ func TestConnect_ConsumerPermanentFailureReturnsError(t *testing.T) {
 	}
 }
 
+// subscriptionFailureSeams makes consumer clients fakes and replaces runSubscription with run.
+func subscriptionFailureSeams(t *testing.T, run func(context.Context) error) {
+	t.Helper()
+	oldClient, oldRun := newConsumerClientWithRetry, runSubscription
+	newConsumerClientWithRetry = func(context.Context, *schemas.KafkaInfo, *schemas.ConsumerConfig) (sarama.Client, error) {
+		return mocksarama.NewFakeClient(), nil
+	}
+	runSubscription = func(parent context.Context, _ <-chan struct{}, _ sarama.Client, _ *schemas.ConsumerConfig, _ *observability.FileTransactionLogger) error {
+		return run(parent)
+	}
+	t.Cleanup(func() { newConsumerClientWithRetry, runSubscription = oldClient, oldRun })
+}
+
+func subscriptionFailureConfig(t *testing.T) *schemas.KafkaInfo {
+	return &schemas.KafkaInfo{
+		Brokers: []string{freeAddr(t)},
+		Version: "2.3.0",
+		Consumers: []*schemas.ConsumerConfig{{
+			Topics: []string{"orders"}, Group: "g", ClientId: "c",
+			Service: schemas.HostConfig{Name: "svc", Port: "1", Path: "/"},
+		}},
+	}
+}
+
+func TestConnect_SubscriptionStartFailureIsFatal(t *testing.T) {
+	wrap := connectEnv(t, time.Minute)
+	subscriptionFailureSeams(t, func(context.Context) error {
+		return errors.New("subscription for topics [orders]: cannot create consumer group: no group")
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- Connect(context.Background(), wrap(subscriptionFailureConfig(t))) }()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "orders")
+		assert.ErrorContains(t, err, "cannot create consumer group")
+	case <-time.After(15 * time.Second):
+		t.Fatal("Connect kept running after a subscription could not start")
+	}
+}
+
+func TestConnect_SubscriptionFailureDuringShutdownIsNotReported(t *testing.T) {
+	wrap := connectEnv(t, time.Minute)
+	started := make(chan struct{})
+	subscriptionFailureSeams(t, func(parent context.Context) error {
+		close(started)
+		<-parent.Done()
+		return errors.New("subscription for topics [orders]: cannot create consumer group: client closed")
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Connect(ctx, wrap(subscriptionFailureConfig(t))) }()
+
+	select {
+	case <-started:
+	case <-time.After(15 * time.Second):
+		t.Fatal("subscription did not start")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(15 * time.Second):
+		t.Fatal("Connect did not return after cancellation")
+	}
+}
+
 func TestConnect_GracefulShutdownOnContextCancel(t *testing.T) {
 	wrap := connectEnv(t, 5*time.Minute)
 	cfg := &schemas.KafkaInfo{
@@ -313,4 +389,149 @@ func TestConnect_UnknownProtocolAborts(t *testing.T) {
 	err := Connect(context.Background(), wrap(cfg))
 	require.Error(t, err)
 	assert.ErrorContains(t, err, `"soap"`)
+}
+
+// failingProducerSeams overrides the app seams for one test: the producer fails
+// after delay, consumer clients are fakes, and runSubscription is recorded
+// instead of running (blocked until its ctx ends, like the real one). It
+// returns the counter of subscription starts.
+func failingProducerSeams(t *testing.T, delay time.Duration) *atomic.Int32 {
+	t.Helper()
+
+	oldProducer := newProducerWithRetry
+	newProducerWithRetry = func(context.Context, *schemas.KafkaInfo) (sarama.SyncProducer, error) {
+		time.Sleep(delay)
+		return nil, errors.New("broker unreachable")
+	}
+
+	oldClient := newConsumerClientWithRetry
+	newConsumerClientWithRetry = func(context.Context, *schemas.KafkaInfo, *schemas.ConsumerConfig) (sarama.Client, error) {
+		return mocksarama.NewFakeClient(), nil
+	}
+
+	var runs atomic.Int32
+	oldRun := runSubscription
+	runSubscription = func(parent context.Context, _ <-chan struct{}, _ sarama.Client, _ *schemas.ConsumerConfig, _ *observability.FileTransactionLogger) error {
+		runs.Add(1)
+		<-parent.Done()
+		return nil
+	}
+
+	t.Cleanup(func() {
+		newProducerWithRetry, newConsumerClientWithRetry, runSubscription = oldProducer, oldClient, oldRun
+	})
+	return &runs
+}
+
+// pollStatus returns the first /status body served while Connect is running.
+func pollStatus(t *testing.T, addr string) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get("http://" + addr + "/status")
+		if err != nil {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+		return string(body)
+	}
+	t.Fatal("could not reach /status while Connect was running")
+	return ""
+}
+
+func TestConnect_ProducerPermanentFailureIsFatalWhenResponsesAreExpected(t *testing.T) {
+	wrap := connectEnv(t, 300*time.Millisecond)
+	oldProducer := newProducerWithRetry
+	newProducerWithRetry = func(context.Context, *schemas.KafkaInfo) (sarama.SyncProducer, error) {
+		return nil, errors.New("broker unreachable")
+	}
+	t.Cleanup(func() { newProducerWithRetry = oldProducer })
+
+	cfg := &schemas.KafkaInfo{
+		Brokers:   []string{freeAddr(t)},
+		Version:   "2.3.0",
+		Producers: []*schemas.ProducerConfig{{Topic: "out"}},
+		Consumers: []*schemas.ConsumerConfig{{
+			Topics: []string{"t"}, Group: "g", ClientId: "c", ResponseTopic: "out",
+			Service: schemas.HostConfig{Name: "svc", Port: "1", Path: "/"},
+		}},
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- Connect(context.Background(), wrap(cfg)) }()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "permanently failed to create producer")
+	case <-time.After(15 * time.Second):
+		t.Fatal("Connect kept running after the producer failed permanently")
+	}
+}
+
+func TestConnect_ProducerFailureGatesConsumersWithResponseTopics(t *testing.T) {
+	wrap := connectEnv(t, time.Minute)
+	runs := failingProducerSeams(t, 500*time.Millisecond) // a window to observe /status
+	cfg := &schemas.KafkaInfo{
+		Brokers:   []string{freeAddr(t)},
+		Version:   "2.3.0",
+		Producers: []*schemas.ProducerConfig{{Topic: "out"}},
+		Consumers: []*schemas.ConsumerConfig{{
+			Topics: []string{"t"}, Group: "g", ClientId: "c", ResponseTopic: "out",
+			Service: schemas.HostConfig{Name: "svc", Port: "1", Path: "/"},
+		}},
+	}
+	appCfg := wrap(cfg)
+	appCfg.HTTPAddr = freeAddr(t)
+
+	done := make(chan error, 1)
+	go func() { done <- Connect(context.Background(), appCfg) }()
+
+	assert.Contains(t, pollStatus(t, appCfg.HTTPAddr), `"consumers_up":0`,
+		"no consumer subscribes when the producer cannot be created")
+
+	select {
+	case err := <-done:
+		assert.ErrorContains(t, err, "permanently failed to create producer")
+	case <-time.After(15 * time.Second):
+		t.Fatal("Connect kept running after the producer failed permanently")
+	}
+	assert.Zero(t, runs.Load(), "a stanza with response_topic must never subscribe after a producer failure")
+}
+
+func TestConnect_ProducerFailureIsNotFatalWithoutResponseTopics(t *testing.T) {
+	wrap := connectEnv(t, time.Minute)
+	runs := failingProducerSeams(t, 0)
+	cfg := &schemas.KafkaInfo{
+		Brokers:   []string{freeAddr(t)},
+		Version:   "2.3.0",
+		Producers: []*schemas.ProducerConfig{{Topic: "out"}},
+		Consumers: []*schemas.ConsumerConfig{{
+			Topics: []string{"t"}, Group: "g", ClientId: "c",
+			Service: schemas.HostConfig{Name: "svc", Port: "1", Path: "/"},
+		}},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Connect(ctx, wrap(cfg)) }()
+
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("Connect must keep running after a producer failure when no stanza has a response_topic, got %v", err)
+	default:
+	}
+	require.Equal(t, int32(1), runs.Load(), "a stanza without response_topic starts reading as before")
+
+	cancel()
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(15 * time.Second):
+		t.Fatal("Connect did not shut down after cancellation")
+	}
 }
