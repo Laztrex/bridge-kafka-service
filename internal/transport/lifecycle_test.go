@@ -69,7 +69,7 @@ func startPipeline(t *testing.T, upstream transport.Upstream, conf *schemas.Cons
 
 	go func() {
 		defer close(p.done)
-		transport.ConsumerResponseFast(l, conf, upstream, p.ch, context.Background())
+		transport.ConsumerResponseFast(l, conf, upstream, p.ch, nil, context.Background())
 		p.ended = time.Now()
 	}()
 	p.ch <- p.ev

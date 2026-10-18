@@ -1,11 +1,7 @@
 package router
 
 import (
-	"fmt"
-	"os"
-
 	"github.com/IBM/sarama"
-	"gopkg.in/yaml.v3"
 
 	"bridge-kafka-service/internal/consts"
 	"bridge-kafka-service/internal/schemas"
@@ -18,8 +14,8 @@ var (
 )
 
 // NewProducer constructs a sarama.SyncProducer using the supplied KafkaInfo
-// configuration merged with YAML tunables loaded from consts.ConfPathProducer.
-func NewProducer(conf *schemas.KafkaInfo) (sarama.SyncProducer, error) {
+// configuration merged with the producer tuning loaded at startup.
+func NewProducer(conf *schemas.KafkaInfo, tuning *Tuning) (sarama.SyncProducer, error) {
 	cfg := sarama.NewConfig()
 	version, err := sarama.ParseKafkaVersion(conf.Version)
 	if err != nil {
@@ -30,14 +26,8 @@ func NewProducer(conf *schemas.KafkaInfo) (sarama.SyncProducer, error) {
 	cfg.Producer.Compression = sarama.CompressionZSTD
 	cfg.Producer.Partitioner = sarama.NewHashPartitioner
 
-	raw, err := os.ReadFile(producerConfigPath)
-	if err != nil {
-		return nil, fmt.Errorf("unable to locate configuration file: %w", err)
-	}
-
-	err = yaml.Unmarshal(raw, &cfg)
-	if err != nil {
-		return nil, fmt.Errorf("unable to parse configuration: %w", err)
+	if err := tuning.apply(cfg); err != nil {
+		return nil, err
 	}
 
 	if cfg.Net.TLS.Enable {

@@ -18,7 +18,7 @@ import (
 // response event handed to the publish channel keeps the consumer stanza config,
 // so the response publisher can apply its failure policy.
 func TestPublishUpstreamResponse_QueuedEventCarriesTheStanzaConfig(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
@@ -31,10 +31,10 @@ func TestPublishUpstreamResponse_QueuedEventCarriesTheStanzaConfig(t *testing.T)
 	ev, _ := newEvent("resp")
 	ev.Config = conf
 
-	transport.SendToService(context.Background(), logger(t), transport.NewHTTPUpstream(conf), ev, 3*time.Second)
+	transport.SendToService(context.Background(), logger(t), transport.NewHTTPUpstream(conf), ev, q, 3*time.Second)
 
 	select {
-	case out := <-transport.PublishChannel:
+	case out := <-q:
 		require.NotNil(t, out.Config, "the queued event carries the stanza config")
 		assert.Same(t, conf, out.Config)
 		assert.Equal(t, schemas.FailureRetry, out.Config.EffectiveFailurePolicy())
@@ -42,5 +42,4 @@ func TestPublishUpstreamResponse_QueuedEventCarriesTheStanzaConfig(t *testing.T)
 	case <-time.After(3 * time.Second):
 		t.Fatal("response event not published")
 	}
-	drainPublish()
 }

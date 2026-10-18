@@ -56,16 +56,6 @@ func newEvent(topic string) (*schemas.ConsumerEvent, *int) {
 	return e, &acks
 }
 
-func drainPublish() {
-	for {
-		select {
-		case <-transport.PublishChannel:
-		default:
-			return
-		}
-	}
-}
-
 func logger(t *testing.T) *observability.FileTransactionLogger {
 	t.Helper()
 	l, err := observability.NewFileTransactionLogger(filepath.Join(t.TempDir(), "m.log"), "")
@@ -83,7 +73,7 @@ func ctxFrom(done <-chan struct{}) context.Context {
 }
 
 func TestSendToService_ForwardsAndCarriesTrackingToResponse(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	var gotBody, gotCustom string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -94,7 +84,7 @@ func TestSendToService_ForwardsAndCarriesTrackingToResponse(t *testing.T) {
 	defer srv.Close()
 
 	ev, acks := newEvent("resp")
-	transport.SendToService(context.Background(), logger(t), transport.NewHTTPUpstream(upstreamConf(t, srv, "resp")), ev, 3*time.Second)
+	transport.SendToService(context.Background(), logger(t), transport.NewHTTPUpstream(upstreamConf(t, srv, "resp")), ev, q, 3*time.Second)
 
 	assert.JSONEq(t, `{"q":1}`, gotBody)
 	assert.Equal(t, "v", gotCustom)
@@ -102,7 +92,7 @@ func TestSendToService_ForwardsAndCarriesTrackingToResponse(t *testing.T) {
 	assert.Equal(t, 0, *acks, "ack travels with the response event instead of settling now")
 
 	select {
-	case out := <-transport.PublishChannel:
+	case out := <-q:
 		assert.JSONEq(t, `{"ok":true}`, string(out.Values.Body.Data))
 		assert.Equal(t, "req-1", out.Values.Body.Headers[consts.HeaderRequestIdKey], "original Request-Id is carried")
 		assert.Equal(t, "client-7", out.Values.Body.Headers[consts.HeaderClientId])
@@ -114,57 +104,57 @@ func TestSendToService_ForwardsAndCarriesTrackingToResponse(t *testing.T) {
 }
 
 func TestSendToService_NonJSONResponseStoredAsString(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("plain text")) }))
 	defer srv.Close()
 
 	ev, _ := newEvent("resp")
-	transport.SendToService(context.Background(), logger(t), transport.NewHTTPUpstream(upstreamConf(t, srv, "resp")), ev, 3*time.Second)
+	transport.SendToService(context.Background(), logger(t), transport.NewHTTPUpstream(upstreamConf(t, srv, "resp")), ev, q, 3*time.Second)
 
-	out := <-transport.PublishChannel
+	out := <-q
 	assert.JSONEq(t, `"plain text"`, string(out.Values.Body.Data))
 }
 
 func TestSendToService_EmptyResponseBody(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) }))
 	defer srv.Close()
 
 	ev, _ := newEvent("resp")
-	transport.SendToService(context.Background(), logger(t), transport.NewHTTPUpstream(upstreamConf(t, srv, "resp")), ev, 3*time.Second)
+	transport.SendToService(context.Background(), logger(t), transport.NewHTTPUpstream(upstreamConf(t, srv, "resp")), ev, q, 3*time.Second)
 
-	out := <-transport.PublishChannel
+	out := <-q
 	assert.Nil(t, out.Values.Body.Data)
 }
 
 func TestSendToService_NoResponseTopicSettlesImmediately(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{}`)) }))
 	defer srv.Close()
 
 	ev, acks := newEvent("")
-	transport.SendToService(context.Background(), logger(t), transport.NewHTTPUpstream(upstreamConf(t, srv, "")), ev, 3*time.Second)
+	transport.SendToService(context.Background(), logger(t), transport.NewHTTPUpstream(upstreamConf(t, srv, "")), ev, q, 3*time.Second)
 
 	assert.Equal(t, 1, ev.Event.Success)
 	assert.Equal(t, 1, *acks)
-	assert.Empty(t, transport.PublishChannel)
+	assert.Empty(t, q)
 }
 
 func TestSendToService_UpstreamDownIsFailureAndSettled(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	srv := httptest.NewServer(http.NotFoundHandler())
 	conf := upstreamConf(t, srv, "resp")
 	srv.Close()
 
 	ev, acks := newEvent("resp")
-	transport.SendToService(context.Background(), logger(t), transport.NewHTTPUpstream(conf), ev, time.Second)
+	transport.SendToService(context.Background(), logger(t), transport.NewHTTPUpstream(conf), ev, q, time.Second)
 
 	assert.Equal(t, 1, ev.Event.Failure)
 	assert.Equal(t, 1, *acks, "terminal failure must not stall the partition")
 }
 
 func TestSendToService_TimeoutIsFailure(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-time.After(2 * time.Second):
@@ -174,14 +164,14 @@ func TestSendToService_TimeoutIsFailure(t *testing.T) {
 	defer srv.Close()
 
 	ev, acks := newEvent("resp")
-	transport.SendToService(context.Background(), logger(t), transport.NewHTTPUpstream(upstreamConf(t, srv, "resp")), ev, 100*time.Millisecond)
+	transport.SendToService(context.Background(), logger(t), transport.NewHTTPUpstream(upstreamConf(t, srv, "resp")), ev, q, 100*time.Millisecond)
 
 	assert.Equal(t, 1, ev.Event.Failure)
 	assert.Equal(t, 1, *acks)
 }
 
 func TestSlowModeCapsConcurrency(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	var inflight, peak atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		n := inflight.Add(1)
@@ -204,7 +194,7 @@ func TestSlowModeCapsConcurrency(t *testing.T) {
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
-		transport.ConsumerResponseSlow(logger(t), conf, transport.NewHTTPUpstream(conf), ch, ctxFrom(ctxDone))
+		transport.ConsumerResponseSlow(logger(t), conf, transport.NewHTTPUpstream(conf), ch, q, ctxFrom(ctxDone))
 	}()
 
 	var acked = make(chan struct{}, 6)
@@ -226,7 +216,7 @@ func TestSlowModeCapsConcurrency(t *testing.T) {
 }
 
 func TestFastModeBelowCeilingDispatchesAllConcurrently(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	release := make(chan struct{})
 	var started atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -241,7 +231,7 @@ func TestFastModeBelowCeilingDispatchesAllConcurrently(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, ctxFrom(make(chan struct{})))
+		transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, q, ctxFrom(make(chan struct{})))
 	}()
 
 	for i := 0; i < 5; i++ {
@@ -260,7 +250,7 @@ func TestFastModeBelowCeilingDispatchesAllConcurrently(t *testing.T) {
 }
 
 func TestFastModeCeilingHoldsBackFurtherCalls(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	transport.FastModeLimit(t, 2)
 	release := make(chan struct{})
 	var started atomic.Int32
@@ -276,7 +266,7 @@ func TestFastModeCeilingHoldsBackFurtherCalls(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, ctxFrom(make(chan struct{})))
+		transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, q, ctxFrom(make(chan struct{})))
 	}()
 
 	for i := 0; i < 5; i++ {
@@ -300,7 +290,7 @@ func TestFastModeCeilingHoldsBackFurtherCalls(t *testing.T) {
 }
 
 func TestFastModeShutdownAtCeilingLeavesWaitingRecordUnsettled(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	transport.FastModeLimit(t, 1)
 	block := make(chan struct{})
 	var started atomic.Int32
@@ -317,7 +307,7 @@ func TestFastModeShutdownAtCeilingLeavesWaitingRecordUnsettled(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, ctxFrom(stop))
+		transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, q, ctxFrom(stop))
 	}()
 
 	flying, _ := newEvent("")
@@ -336,7 +326,6 @@ func TestFastModeShutdownAtCeilingLeavesWaitingRecordUnsettled(t *testing.T) {
 		t.Fatal("a dispatch waiting for the ceiling must return immediately on shutdown")
 	}
 	assert.Zero(t, *waitingAcks, "the waiting record is not settled and will be redelivered")
-	drainPublish()
 }
 
 // newConnCountingServer returns an httptest server that counts accepted
@@ -365,9 +354,9 @@ func runPipelines(t *testing.T, conf *schemas.ConsumerConfig, total int, slowMod
 	go func() {
 		defer close(done)
 		if slowMode {
-			transport.ConsumerResponseSlow(logger(t), conf, transport.NewHTTPUpstream(conf), ch, ctxFrom(make(chan struct{})))
+			transport.ConsumerResponseSlow(logger(t), conf, transport.NewHTTPUpstream(conf), ch, nil, ctxFrom(make(chan struct{})))
 		} else {
-			transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, ctxFrom(make(chan struct{})))
+			transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, nil, ctxFrom(make(chan struct{})))
 		}
 	}()
 
@@ -388,7 +377,6 @@ func runPipelines(t *testing.T, conf *schemas.ConsumerConfig, total int, slowMod
 }
 
 func TestHTTPUpstreamReusesConnections_SlowMode(t *testing.T) {
-	drainPublish()
 	var newConns atomic.Int32
 	srv := newConnCountingServer(t, &newConns)
 
@@ -410,7 +398,6 @@ func TestHTTPUpstreamReusesConnections_SlowMode(t *testing.T) {
 }
 
 func TestHTTPUpstreamReusesConnections_FastModeCeiling(t *testing.T) {
-	drainPublish()
 	transport.FastModeLimit(t, 4)
 	var newConns atomic.Int32
 	srv := newConnCountingServer(t, &newConns)
@@ -444,9 +431,9 @@ func TestDispatcherStopsOnContextCancel(t *testing.T) {
 			go func() {
 				defer close(done)
 				if maxConn > 0 {
-					transport.ConsumerResponseSlow(logger(t), conf, transport.NewHTTPUpstream(conf), ch, ctxFrom(stop))
+					transport.ConsumerResponseSlow(logger(t), conf, transport.NewHTTPUpstream(conf), ch, nil, ctxFrom(stop))
 				} else {
-					transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, ctxFrom(stop))
+					transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, nil, ctxFrom(stop))
 				}
 			}()
 			for i := 0; i < 2; i++ {
@@ -466,17 +453,16 @@ func TestDispatcherStopsOnContextCancel(t *testing.T) {
 }
 
 func TestPublishReply_FullPublishChannelDropsAndSettles(t *testing.T) {
-	drainPublish()
-	for i := 0; i < cap(transport.PublishChannel); i++ {
-		transport.PublishChannel <- &schemas.ConsumerEvent{}
+	q := transport.NewResponseQueue()
+	for i := 0; i < cap(q); i++ {
+		q <- &schemas.ConsumerEvent{}
 	}
-	defer drainPublish()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{}`)) }))
 	defer srv.Close()
 	ev, acks := newEvent("resp")
 
-	transport.SendToService(context.Background(), logger(t), transport.NewHTTPUpstream(upstreamConf(t, srv, "resp")), ev, 3*time.Second)
+	transport.SendToService(context.Background(), logger(t), transport.NewHTTPUpstream(upstreamConf(t, srv, "resp")), ev, q, 3*time.Second)
 
 	assert.Equal(t, 1, *acks, "a dropped response must still settle the offset")
 }
@@ -514,11 +500,11 @@ func (f *fakeUpstream) Call(_ context.Context, req transport.UpstreamRequest) (t
 }
 
 func TestSharedPath_ResponseIsPublishedWithCarriedTrackingHeaders(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	up := &fakeUpstream{resp: transport.UpstreamResponse{Body: []byte(`{"answer":42}`), Header: http.Header{"X-Other": {"1"}}}}
 	ev, acks := newEvent("resp")
 
-	transport.SendToService(context.Background(), logger(t), up, ev, time.Second)
+	transport.SendToService(context.Background(), logger(t), up, ev, q, time.Second)
 
 	assert.JSONEq(t, `{"q":1}`, string(up.got.Body))
 	assert.Equal(t, "client-7", up.got.Headers[consts.HeaderClientId])
@@ -526,7 +512,7 @@ func TestSharedPath_ResponseIsPublishedWithCarriedTrackingHeaders(t *testing.T) 
 	assert.Equal(t, 0, *acks, "ack travels with the response event")
 
 	select {
-	case out := <-transport.PublishChannel:
+	case out := <-q:
 		assert.JSONEq(t, `{"answer":42}`, string(out.Values.Body.Data))
 		assert.Equal(t, "req-1", out.Values.Body.Headers[consts.HeaderRequestIdKey])
 		assert.Equal(t, "client-7", out.Values.Body.Headers[consts.HeaderClientId])
@@ -538,39 +524,39 @@ func TestSharedPath_ResponseIsPublishedWithCarriedTrackingHeaders(t *testing.T) 
 }
 
 func TestSharedPath_NilResponseHeadersAreTolerated(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	ev, _ := newEvent("resp")
 
-	transport.SendToService(context.Background(), logger(t), &fakeUpstream{resp: transport.UpstreamResponse{Body: []byte(`{}`)}}, ev, time.Second)
+	transport.SendToService(context.Background(), logger(t), &fakeUpstream{resp: transport.UpstreamResponse{Body: []byte(`{}`)}}, ev, q, time.Second)
 
-	out := <-transport.PublishChannel
+	out := <-q
 	assert.Equal(t, "req-1", out.Values.Body.Headers[consts.HeaderRequestIdKey])
 }
 
 func TestSharedPath_FailureSettlesAndPublishesNothing(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	ev, acks := newEvent("resp")
 
-	transport.SendToService(context.Background(), logger(t), &fakeUpstream{err: errors.New("down")}, ev, time.Second)
+	transport.SendToService(context.Background(), logger(t), &fakeUpstream{err: errors.New("down")}, ev, q, time.Second)
 
 	assert.Equal(t, 1, ev.Event.Failure)
 	assert.Equal(t, 1, *acks)
-	assert.Empty(t, transport.PublishChannel)
+	assert.Empty(t, q)
 }
 
 func TestSharedPath_NoResponseTopicSettlesAfterTheCall(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	ev, acks := newEvent("")
 
-	transport.SendToService(context.Background(), logger(t), &fakeUpstream{resp: transport.UpstreamResponse{Body: []byte(`{}`)}}, ev, time.Second)
+	transport.SendToService(context.Background(), logger(t), &fakeUpstream{resp: transport.UpstreamResponse{Body: []byte(`{}`)}}, ev, q, time.Second)
 
 	assert.Equal(t, 1, ev.Event.Success)
 	assert.Equal(t, 1, *acks)
-	assert.Empty(t, transport.PublishChannel)
+	assert.Empty(t, q)
 }
 
 func TestRequestServiceEventHasNonZeroDuration(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	file := filepath.Join(t.TempDir(), "m.log")
 	l, err := observability.NewFileTransactionLogger(file, "")
 	require.NoError(t, err)
@@ -578,7 +564,7 @@ func TestRequestServiceEventHasNonZeroDuration(t *testing.T) {
 	l.Run()
 	ev, _ := newEvent("")
 
-	transport.SendToService(context.Background(), l, &fakeUpstream{resp: transport.UpstreamResponse{Body: []byte(`{}`)}}, ev, time.Second)
+	transport.SendToService(context.Background(), l, &fakeUpstream{resp: transport.UpstreamResponse{Body: []byte(`{}`)}}, ev, q, time.Second)
 	l.Shutdown()
 
 	assert.Positive(t, metricsfile.Durations(t, file, consts.EventRequestService)["req-1"])

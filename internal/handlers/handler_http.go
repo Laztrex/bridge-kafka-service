@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"net/http"
+	"sync"
 
 	"github.com/IBM/sarama"
 	"github.com/rs/zerolog/log"
@@ -47,26 +48,43 @@ func NewHandlers(
 	})
 }
 
-// ResponsePublish drains transport.PublishChannel and publishes service
-// responses to their response topics. It is independent of the HTTP publish
-// endpoint and must run whenever consumers are active, even with no producers
-// configured (events are then failed and settled instead of piling up).
+// ResponsePublish drains one pipeline's response queue with workers concurrent publishers and
+// publishes service responses to their response topic; it returns once every worker has
+// returned. Each pipeline has its own queue, so a response topic that is slow or rejects writes
+// holds back only that pipeline. It must run whenever its pipeline is active, even with no
+// producers configured (events are then failed and settled instead of piling up).
 // Responses of on_failure: retry stanzas are retried with backoff until they
 // are written (design D1); after ctx is cancelled the drain gives every queued
 // event a single attempt, so no new waits are added on shutdown.
 func ResponsePublish(
 	ctx context.Context,
+	queue <-chan *schemas.ConsumerEvent,
+	workers int,
 	logTransaction schemas.TransactionLogger,
 	producers ProducerLookup,
 ) {
+	var wg sync.WaitGroup
+	for range max(workers, 1) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			publishFrom(ctx, queue, logTransaction, producers)
+		}()
+	}
+	wg.Wait()
+}
+
+// publishFrom is one publisher of a queue: it publishes events while ctx is alive, then gives
+// every event still queued one attempt and returns when the queue is empty.
+func publishFrom(ctx context.Context, queue <-chan *schemas.ConsumerEvent, logTransaction schemas.TransactionLogger, producers ProducerLookup) {
 	for {
 		select {
-		case msg := <-transport.PublishChannel:
+		case msg := <-queue:
 			publishOne(ctx, logTransaction, producers, msg)
 		case <-ctx.Done():
 			for {
 				select {
-				case msg := <-transport.PublishChannel:
+				case msg := <-queue:
 					publishOne(ctx, logTransaction, producers, msg)
 				default:
 					return

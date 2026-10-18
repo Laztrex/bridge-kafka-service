@@ -245,20 +245,8 @@ func TestPublishOneRetry_NonTransientErrorSettlesAfterOneAttempt(t *testing.T) {
 		"the failure is recorded once")
 }
 
-// drainPublishChannel empties the global publish channel so a test observes
-// only the events it queued itself.
-func drainPublishChannel() {
-	for {
-		select {
-		case <-transport.PublishChannel:
-		default:
-			return
-		}
-	}
-}
-
 func TestResponsePublishRetry_DrainGivesOneAttemptAndLeavesUnsettled(t *testing.T) {
-	drainPublishChannel()
+	q := transport.NewResponseQueue()
 	l, _ := publishLogger(t)
 	reg, producer := newMockRegistry(t, "resp")
 	producer.ExpectSendMessageAndFail(errPublishDown)
@@ -271,12 +259,12 @@ func TestResponsePublishRetry_DrainGivesOneAttemptAndLeavesUnsettled(t *testing.
 	// both events queued, then ctx cancelled: the drain that follows must give
 	// each a single attempt (a retry would exhaust the mock's expectations)
 	// and leave both unsettled, so the records are redelivered
-	transport.PublishChannel <- ev1
-	transport.PublishChannel <- ev2
+	q <- ev1
+	q <- ev2
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	done := make(chan struct{})
-	go func() { defer close(done); ResponsePublish(ctx, l, reg) }()
+	go func() { defer close(done); ResponsePublish(ctx, q, 1, l, reg) }()
 
 	select {
 	case <-done:

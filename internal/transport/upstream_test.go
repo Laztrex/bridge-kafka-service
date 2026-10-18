@@ -29,3 +29,15 @@ func TestConcurrencyLimit(t *testing.T) {
 		Service: schemas.HostConfig{MaxConn: 8},
 	}), "a positive max_conn is the limit itself")
 }
+
+func TestPublisherCount(t *testing.T) {
+	withMaxConn := func(n int) *schemas.ConsumerConfig {
+		return &schemas.ConsumerConfig{Service: schemas.HostConfig{MaxConn: n}}
+	}
+	assert.Equal(t, 1, transport.PublisherCount(withMaxConn(1)), "a sequential pipeline keeps one publisher, and its order")
+	assert.Equal(t, 4, transport.PublisherCount(withMaxConn(4)), "below the cap the pipeline limit is the count")
+	assert.Equal(t, transport.MaxPublishersPerPipeline, transport.PublisherCount(withMaxConn(0)), "fast mode is capped")
+
+	transport.FastModeLimit(t, 3)
+	assert.Equal(t, 3, transport.PublisherCount(withMaxConn(0)), "a fast-mode ceiling below the cap is the count")
+}

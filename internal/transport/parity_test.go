@@ -34,14 +34,14 @@ type outcome struct {
 // observe runs one record through the shared path over the given upstream.
 func observe(t *testing.T, up transport.Upstream, topic string, timeout time.Duration) outcome {
 	t.Helper()
-	drainPublish()
+	q := transport.NewResponseQueue()
 	ev, acks := newEvent(topic)
 
-	transport.SendToService(context.Background(), logger(t), up, ev, timeout)
+	transport.SendToService(context.Background(), logger(t), up, ev, q, timeout)
 
 	out := outcome{success: ev.Event.Success, failure: ev.Event.Failure, acks: *acks}
 	select {
-	case rec := <-transport.PublishChannel:
+	case rec := <-q:
 		out.published = true
 		out.requestID = rec.Values.Body.Headers[consts.HeaderRequestIdKey]
 		out.clientID = rec.Values.Body.Headers[consts.HeaderClientId]

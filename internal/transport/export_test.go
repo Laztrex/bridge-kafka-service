@@ -19,10 +19,11 @@ func SendToServiceRetrying(
 	logTransaction schemas.TransactionLogger,
 	upstream Upstream,
 	msg *schemas.ConsumerEvent,
+	queue chan<- *schemas.ConsumerEvent,
 	timeout time.Duration,
 	retry *RetryState,
 ) {
-	sendToService(abandon, logTransaction, upstream, msg, timeout, retry)
+	sendToService(abandon, logTransaction, upstream, msg, queue, timeout, retry)
 }
 
 func (r *retryState) Succeeded() { r.succeeded() }

@@ -195,7 +195,7 @@ func TestRunSubscription_ProcessesMessagesTogglesPauseAndStopsOnCancel(t *testin
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		RunSubscription(ctx, toggle, mocksarama.NewFakeClient(), conf, newTestLogger(t))
+		RunSubscription(ctx, toggle, mocksarama.NewFakeClient(), conf, nil, newTestLogger(t))
 	}()
 
 	g.QueueMessage(&sarama.ConsumerMessage{Topic: "in", Offset: 3, Value: []byte(`{"q":1}`)})
@@ -225,7 +225,7 @@ func TestRunSubscription_SlowModeAndGroupCreationFailure(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		RunSubscription(context.Background(), nil, mocksarama.NewFakeClient(), conf, newTestLogger(t))
+		RunSubscription(context.Background(), nil, mocksarama.NewFakeClient(), conf, nil, newTestLogger(t))
 	}()
 	select {
 	case <-done:
@@ -239,7 +239,7 @@ func TestRunSubscription_SlowModeAndGroupCreationFailure(t *testing.T) {
 	done2 := make(chan struct{})
 	go func() {
 		defer close(done2)
-		RunSubscription(ctx, nil, mocksarama.NewFakeClient(), conf, newTestLogger(t))
+		RunSubscription(ctx, nil, mocksarama.NewFakeClient(), conf, nil, newTestLogger(t))
 	}()
 	g.QueueMessage(&sarama.ConsumerMessage{Topic: "in", Offset: 1, Value: []byte(`{}`)})
 	require.Eventually(t, func() bool { return len(g.MarkedOffsets()) == 1 }, 5*time.Second, 10*time.Millisecond)
@@ -255,7 +255,7 @@ func TestRunSubscription_StartFailuresReturnErrorsAndCleanStopReturnsNil(t *test
 	old := newConsumerGroup
 	newConsumerGroup = func(string, sarama.Client) (sarama.ConsumerGroup, error) { return nil, errors.New("no group") }
 	err := RunSubscription(context.Background(), nil, mocksarama.NewFakeClient(),
-		&schemas.ConsumerConfig{Topics: []string{"orders"}, Group: "g", Service: host}, newTestLogger(t))
+		&schemas.ConsumerConfig{Topics: []string{"orders"}, Group: "g", Service: host}, nil, newTestLogger(t))
 	newConsumerGroup = old
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "orders")
@@ -264,7 +264,7 @@ func TestRunSubscription_StartFailuresReturnErrorsAndCleanStopReturnsNil(t *test
 
 	badTarget := schemas.HostConfig{Name: "%zz", Port: "1", Protocol: schemas.ProtocolGRPC}
 	err = RunSubscription(context.Background(), nil, mocksarama.NewFakeClient(),
-		&schemas.ConsumerConfig{Topics: []string{"payments"}, Group: "g", Service: badTarget}, newTestLogger(t))
+		&schemas.ConsumerConfig{Topics: []string{"payments"}, Group: "g", Service: badTarget}, nil, newTestLogger(t))
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "payments")
 	assert.ErrorContains(t, err, "cannot create upstream")
@@ -273,7 +273,7 @@ func TestRunSubscription_StartFailuresReturnErrorsAndCleanStopReturnsNil(t *test
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	assert.NoError(t, RunSubscription(ctx, nil, mocksarama.NewFakeClient(),
-		&schemas.ConsumerConfig{Topics: []string{"in"}, Group: "g", Service: host}, newTestLogger(t)))
+		&schemas.ConsumerConfig{Topics: []string{"in"}, Group: "g", Service: host}, nil, newTestLogger(t)))
 }
 
 func writeYAML(t *testing.T, content string) string {
@@ -295,33 +295,24 @@ func captureClient(t *testing.T) *sarama.Config {
 	return &got
 }
 
+// consumerTuning loads content as the consumer tuning file.
+func consumerTuning(t *testing.T, content string) *Tuning {
+	t.Helper()
+	useConsumerFile(t, content)
+	tuning, err := LoadConsumerTuning()
+	require.NoError(t, err)
+	return tuning
+}
+
 func TestNewConsumerClient_ConfigHandling(t *testing.T) {
 	conf := &schemas.KafkaInfo{Brokers: []string{"b:1"}, Version: "2.3.0"}
 	cc := &schemas.ConsumerConfig{ClientId: "cid"}
 
-	t.Run("missing file", func(t *testing.T) {
-		old := consumerConfigPath
-		consumerConfigPath = filepath.Join(t.TempDir(), "nope.yaml")
-		t.Cleanup(func() { consumerConfigPath = old })
-		_, err := NewConsumerClient(conf, cc)
-		assert.ErrorContains(t, err, "unable to locate configuration file")
-	})
-
-	t.Run("unparsable file", func(t *testing.T) {
-		old := consumerConfigPath
-		consumerConfigPath = writeYAML(t, "net: [unclosed")
-		t.Cleanup(func() { consumerConfigPath = old })
-		_, err := NewConsumerClient(conf, cc)
-		assert.ErrorContains(t, err, "unable to parse configuration")
-	})
-
 	t.Run("interval omitted keeps sarama default", func(t *testing.T) {
-		old := consumerConfigPath
-		consumerConfigPath = writeYAML(t, "consumer:\n  return:\n    errors: true\n")
-		t.Cleanup(func() { consumerConfigPath = old })
+		tuning := consumerTuning(t, "consumer:\n  return:\n    errors: true\n")
 		got := captureClient(t)
 
-		_, err := NewConsumerClient(conf, cc)
+		_, err := NewConsumerClient(conf, cc, tuning)
 
 		require.NoError(t, err)
 		assert.Equal(t, sarama.NewConfig().Consumer.Offsets.AutoCommit.Interval, got.Consumer.Offsets.AutoCommit.Interval)
@@ -330,15 +321,13 @@ func TestNewConsumerClient_ConfigHandling(t *testing.T) {
 	})
 
 	t.Run("interval set and TLS attached", func(t *testing.T) {
-		old := consumerConfigPath
-		consumerConfigPath = writeYAML(t, "OffsetsAutoCommitInterval: 2s\nnet:\n  tls:\n    enable: true\n")
-		t.Cleanup(func() { consumerConfigPath = old })
+		tuning := consumerTuning(t, "OffsetsAutoCommitInterval: 2s\nnet:\n  tls:\n    enable: true\n")
 		got := captureClient(t)
 		withTLS := *conf
 		withTLS.Version = "not-a-version"
 		withTLS.TLSConf = nil
 
-		_, err := NewConsumerClient(&withTLS, cc)
+		_, err := NewConsumerClient(&withTLS, cc, tuning)
 
 		require.NoError(t, err)
 		assert.Equal(t, 2*time.Second, got.Consumer.Offsets.AutoCommit.Interval)
@@ -347,24 +336,56 @@ func TestNewConsumerClient_ConfigHandling(t *testing.T) {
 	})
 
 	t.Run("auto-commit cannot be disabled", func(t *testing.T) {
-		old := consumerConfigPath
-		consumerConfigPath = writeYAML(t, "consumer:\n  offsets:\n    autocommit:\n      enable: false\n")
-		t.Cleanup(func() { consumerConfigPath = old })
+		tuning := consumerTuning(t, "consumer:\n  offsets:\n    autocommit:\n      enable: false\n")
 		got := captureClient(t)
 
-		_, err := NewConsumerClient(conf, cc)
+		_, err := NewConsumerClient(conf, cc, tuning)
 
 		require.NoError(t, err)
 		assert.True(t, got.Consumer.Offsets.AutoCommit.Enable)
 	})
+
+	t.Run("code defaults without tuning", func(t *testing.T) {
+		got := captureClient(t)
+
+		_, err := NewConsumerClient(conf, cc, nil)
+
+		require.NoError(t, err)
+		assert.Equal(t, 60*time.Second, got.Consumer.Group.Session.Timeout)
+		assert.Equal(t, 10*time.Second, got.Consumer.Group.Heartbeat.Interval)
+		assert.Equal(t, 10*time.Second, got.Consumer.MaxProcessingTime)
+		require.Len(t, got.Consumer.Group.Rebalance.GroupStrategies, 1)
+		assert.Equal(t, "range", got.Consumer.Group.Rebalance.GroupStrategies[0].Name())
+		assert.True(t, got.Consumer.Offsets.AutoCommit.Enable)
+	})
+
+	t.Run("session timeout overrides the default", func(t *testing.T) {
+		tuning := consumerTuning(t, "consumer:\n  group:\n    session:\n      timeout: 20s\n")
+		got := captureClient(t)
+
+		_, err := NewConsumerClient(conf, cc, tuning)
+
+		require.NoError(t, err)
+		assert.Equal(t, 20*time.Second, got.Consumer.Group.Session.Timeout)
+		assert.Equal(t, 10*time.Second, got.Consumer.Group.Heartbeat.Interval, "other defaults are kept")
+	})
+
+	t.Run("strategy reaches the group config", func(t *testing.T) {
+		tuning := consumerTuning(t, "consumer:\n  group:\n    rebalance:\n      strategy: cooperative-sticky\n")
+		got := captureClient(t)
+
+		_, err := NewConsumerClient(conf, cc, tuning)
+
+		require.NoError(t, err)
+		require.Len(t, got.Consumer.Group.Rebalance.GroupStrategies, 1)
+		assert.Equal(t, "cooperative-sticky", got.Consumer.Group.Rebalance.GroupStrategies[0].Name())
+	})
 }
 
 func TestNewConsumerClient_RealConstructorFailsAgainstDeadBroker(t *testing.T) {
-	old := consumerConfigPath
-	consumerConfigPath = writeYAML(t, "metadata:\n  retry:\n    max: 0\n")
-	t.Cleanup(func() { consumerConfigPath = old })
+	tuning := consumerTuning(t, "metadata:\n  retry:\n    max: 0\n")
 
-	_, err := NewConsumerClient(&schemas.KafkaInfo{Brokers: []string{"127.0.0.1:1"}, Version: "2.3.0"}, &schemas.ConsumerConfig{})
+	_, err := NewConsumerClient(&schemas.KafkaInfo{Brokers: []string{"127.0.0.1:1"}, Version: "2.3.0"}, &schemas.ConsumerConfig{}, tuning)
 	assert.Error(t, err)
 }
 
@@ -471,7 +492,7 @@ func TestRunSubscription_ShutdownAbandonsHungCallsWithinTheDrainWindowAndKeepsTh
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		RunSubscription(ctx, nil, mocksarama.NewFakeClient(), conf, newTestLogger(t))
+		RunSubscription(ctx, nil, mocksarama.NewFakeClient(), conf, nil, newTestLogger(t))
 	}()
 	g.QueueMessage(&sarama.ConsumerMessage{Topic: "in", Offset: 7, Value: []byte(`{}`)})
 	select {

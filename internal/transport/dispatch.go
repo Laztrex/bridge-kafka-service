@@ -38,13 +38,14 @@ func ConsumerResponseFast(
 	conf *schemas.ConsumerConfig,
 	upstream Upstream,
 	ch chan *schemas.ConsumerEvent,
+	queue chan<- *schemas.ConsumerEvent,
 	ctx context.Context,
 ) {
 	log.Info().Msgf(
 		"fast mode for %s:%s%s (max_conn: %d, in-flight ceiling: %d)",
 		conf.Service.Name, conf.Service.Port, conf.Service.Path, conf.Service.MaxConn, fastModeLimit,
 	)
-	withReplyService(logTransaction, conf, upstream, ch, ctx)
+	withReplyService(logTransaction, conf, upstream, ch, queue, ctx)
 }
 
 func ConsumerResponseSlow(
@@ -52,30 +53,32 @@ func ConsumerResponseSlow(
 	conf *schemas.ConsumerConfig,
 	upstream Upstream,
 	ch chan *schemas.ConsumerEvent,
+	queue chan<- *schemas.ConsumerEvent,
 	ctx context.Context,
 ) {
 	log.Info().Msgf(
 		"slow mode for %s:%s%s (max_conn: %d)",
 		conf.Service.Name, conf.Service.Port, conf.Service.Path, conf.Service.MaxConn,
 	)
-	withReplyService(logTransaction, conf, upstream, ch, ctx)
+	withReplyService(logTransaction, conf, upstream, ch, queue, ctx)
 }
 
 // DefaultDrainWindow is how long a stopping pipeline waits for in-flight upstream calls before
 // abandoning them when ConsumerConfig.DrainWindow is unset.
 const DefaultDrainWindow = 10 * time.Second
 
-// SendToService performs one upstream call for msg, bounded by timeout, and settles it.
-// A call that fails after abandon is cancelled (drain window over) records no failure and
-// leaves the offset unsettled, so the record is redelivered after restart.
+// SendToService performs one upstream call for msg, bounded by timeout, hands the response to
+// the pipeline's queue and settles it. A call that fails after abandon is cancelled (drain window
+// over) records no failure and leaves the offset unsettled, so the record is redelivered after restart.
 func SendToService(
 	abandon context.Context,
 	logTransaction schemas.TransactionLogger,
 	upstream Upstream,
 	msg *schemas.ConsumerEvent,
+	queue chan<- *schemas.ConsumerEvent,
 	timeout time.Duration,
 ) {
-	sendToService(abandon, logTransaction, upstream, msg, timeout, nil)
+	sendToService(abandon, logTransaction, upstream, msg, queue, timeout, nil)
 }
 
 // sendToService is SendToService with the failure policy: nil retry means on_failure: skip;
@@ -85,6 +88,7 @@ func sendToService(
 	logTransaction schemas.TransactionLogger,
 	upstream Upstream,
 	msg *schemas.ConsumerEvent,
+	queue chan<- *schemas.ConsumerEvent,
 	timeout time.Duration,
 	retry *retryState,
 ) {
@@ -112,7 +116,7 @@ func sendToService(
 			if retry != nil {
 				retry.succeeded()
 			}
-			err = publishUpstreamResponse(abandon, msg, resp, retry != nil)
+			err = publishUpstreamResponse(abandon, msg, resp, queue, retry != nil)
 			if errors.Is(err, errPublishAbandoned) {
 				abandoned = true
 				log.Warn().Str(consts.HeaderRequestIdKey, requestId).
@@ -185,7 +189,7 @@ func recordFailure(msg *schemas.ConsumerEvent, err error) {
 	log.Error().Str(consts.HeaderRequestIdKey, msg.Values.RequestId).Msgf("error request to service: %v", err)
 }
 
-// withReplyService dispatches the events of ch to upstream, at most one call
+// withReplyService dispatches the events of ch to upstream and hands responses to queue, at most one call
 // per semaphore slot at a time: service.max_conn slots in slow mode, the
 // built-in fast-mode ceiling otherwise. On stop it waits for in-flight calls up
 // to the drain window, then abandons the rest; a dispatch waiting for a free
@@ -195,6 +199,7 @@ func withReplyService(
 	conf *schemas.ConsumerConfig,
 	upstream Upstream,
 	ch chan *schemas.ConsumerEvent,
+	queue chan<- *schemas.ConsumerEvent,
 	ctx context.Context,
 ) {
 
@@ -250,7 +255,7 @@ func withReplyService(
 					defer calls.Done()
 					defer func() { <-sem }()
 
-					sendToService(abandon, logTransaction, upstream, msg, timeout, retry)
+					sendToService(abandon, logTransaction, upstream, msg, queue, timeout, retry)
 				}(msgRequest)
 			case <-ctx.Done():
 				log.Info().Msg("context cancelled while waiting for a call slot, exiting withReplyService")

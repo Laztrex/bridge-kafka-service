@@ -26,6 +26,7 @@ import (
 	"bridge-kafka-service/internal/observability"
 	"bridge-kafka-service/internal/router"
 	"bridge-kafka-service/internal/schemas"
+	"bridge-kafka-service/internal/transport"
 )
 
 // newProducerWithRetry is a seam so tests can supply a producer without a broker.
@@ -36,6 +37,9 @@ var newConsumerClientWithRetry = createConsumerClientWithRetry
 
 // runSubscription is a seam so tests can observe whether consumption starts.
 var runSubscription = router.RunSubscription
+
+// responsePublish is a seam so tests can observe the per-pipeline publishers.
+var responsePublish = handlers.ResponsePublish
 
 // retryWindow is how long Kafka client creation is retried before giving up.
 var retryWindow = 5 * time.Minute
@@ -59,6 +63,11 @@ func Connect(ctx context.Context, cfg *config.Config) error {
 
 	if err := config.PrepareUpstreams(kafkaConfig); err != nil {
 		return fmt.Errorf("invalid upstream configuration: %w", err)
+	}
+
+	consumerTuning, producerTuning, err := loadTuning(kafkaConfig)
+	if err != nil {
+		return err
 	}
 
 	logTransaction, err := observability.NewFileTransactionLogger(cfg.MetricFilePath(), cfg.AuditGRPCEndpoint)
@@ -104,7 +113,7 @@ func Connect(ctx context.Context, cfg *config.Config) error {
 	go func() {
 		defer producerBg.Done()
 		defer close(producersSettled)
-		if err := startProducer(ctx, kafkaConfig, registry); err != nil && ctx.Err() == nil {
+		if err := startProducer(ctx, kafkaConfig, producerTuning, registry); err != nil && ctx.Err() == nil {
 			producerFailed.Store(true)
 			if needsResponses {
 				errCh <- fmt.Errorf("permanently failed to create producer: %w", err)
@@ -112,22 +121,32 @@ func Connect(ctx context.Context, cfg *config.Config) error {
 		}
 	}()
 
+	// Each stanza with a response_topic gets its own response queue and publishers, so a
+	// response topic that fails holds back only its own pipeline.
 	publishCtx, stopPublish := context.WithCancel(context.Background())
-	publishDone := make(chan struct{})
-	go func() {
-		defer close(publishDone)
-		handlers.ResponsePublish(publishCtx, logTransaction, registry)
-	}()
+	var publishers sync.WaitGroup
+	queues := make([]chan *schemas.ConsumerEvent, len(kafkaConfig.Consumers))
+	for i, c := range kafkaConfig.Consumers {
+		if c == nil || c.ResponseTopic == "" {
+			continue
+		}
+		queues[i] = transport.NewResponseQueue()
+		publishers.Add(1)
+		go func(queue <-chan *schemas.ConsumerEvent, workers int) {
+			defer publishers.Done()
+			responsePublish(publishCtx, queue, workers, logTransaction, registry)
+		}(queues[i], transport.PublisherCount(c))
+	}
 
 	toggles := make([]chan struct{}, len(kafkaConfig.Consumers))
 	var wg sync.WaitGroup
 	for i, consumerConfig := range kafkaConfig.Consumers {
 		toggles[i] = make(chan struct{}, 1)
 		wg.Add(1)
-		go func(conf *schemas.ConsumerConfig, toggle <-chan struct{}) {
+		go func(conf *schemas.ConsumerConfig, toggle <-chan struct{}, queue chan<- *schemas.ConsumerEvent) {
 			defer wg.Done()
 
-			consumerClient, err := newConsumerClientWithRetry(ctx, kafkaConfig, conf)
+			consumerClient, err := newConsumerClientWithRetry(ctx, kafkaConfig, conf, consumerTuning)
 			if err != nil {
 				if ctx.Err() == nil {
 					errCh <- fmt.Errorf("permanently failed to create consumer client for %v: %w", conf.Topics, err)
@@ -153,10 +172,10 @@ func Connect(ctx context.Context, cfg *config.Config) error {
 
 			log.Info().Msgf("consumer client initialized for topics: %v", conf.Topics)
 			ready.consumerUp()
-			if err := runSubscription(ctx, toggle, consumerClient, conf, logTransaction); err != nil && ctx.Err() == nil {
+			if err := runSubscription(ctx, toggle, consumerClient, conf, queue, logTransaction); err != nil && ctx.Err() == nil {
 				errCh <- err
 			}
-		}(consumerConfig, toggles[i])
+		}(consumerConfig, toggles[i], queues[i])
 	}
 
 	usr1 := make(chan os.Signal, 1)
@@ -192,7 +211,7 @@ loop:
 	wg.Wait()
 	producerBg.Wait()
 	stopPublish()
-	<-publishDone
+	publishers.Wait()
 	closeProducer(registry)
 
 	log.Info().Msg("shutdown complete")
@@ -203,11 +222,11 @@ loop:
 // binds it to every allowed topic. An error is returned so the caller can decide
 // whether it is fatal; a permanent failure is logged and leaves the registry
 // empty: publishing then answers 503 while consumption continues.
-func startProducer(ctx context.Context, kafkaConfig *schemas.KafkaInfo, registry *router.ProducerRegistry) error {
+func startProducer(ctx context.Context, kafkaConfig *schemas.KafkaInfo, tuning *router.Tuning, registry *router.ProducerRegistry) error {
 	if len(kafkaConfig.Producers) == 0 {
 		return nil
 	}
-	producer, err := newProducerWithRetry(ctx, kafkaConfig)
+	producer, err := newProducerWithRetry(ctx, kafkaConfig, tuning)
 	if err != nil {
 		if ctx.Err() == nil {
 			log.Error().Msgf("permanently failed to create producer: %v", err)
@@ -221,6 +240,26 @@ func startProducer(ctx context.Context, kafkaConfig *schemas.KafkaInfo, registry
 	}
 	registry.Set(producer, topics)
 	return nil
+}
+
+// loadTuning loads the Kafka client tuning files once, before anything starts, and only those
+// whose client is needed: the consumer file with an active stanza, the producer file with a
+// producer. A missing or broken file can never heal, so it stops startup instead of being retried.
+func loadTuning(kafkaConfig *schemas.KafkaInfo) (consumer, producer *router.Tuning, err error) {
+	for _, c := range kafkaConfig.Consumers {
+		if c != nil && len(c.Topics) > 0 {
+			if consumer, err = router.LoadConsumerTuning(); err != nil {
+				return nil, nil, fmt.Errorf("invalid Kafka consumer tuning: %w", err)
+			}
+			break
+		}
+	}
+	if len(kafkaConfig.Producers) > 0 {
+		if producer, err = router.LoadProducerTuning(); err != nil {
+			return nil, nil, fmt.Errorf("invalid Kafka producer tuning: %w", err)
+		}
+	}
+	return consumer, producer, nil
 }
 
 // closeProducer closes the shared producer exactly once, however many topics map to it.
@@ -237,12 +276,12 @@ func closeProducer(registry *router.ProducerRegistry) {
 	}
 }
 
-func createProducerWithRetry(ctx context.Context, kafkaConfig *schemas.KafkaInfo) (sarama.SyncProducer, error) {
+func createProducerWithRetry(ctx context.Context, kafkaConfig *schemas.KafkaInfo, tuning *router.Tuning) (sarama.SyncProducer, error) {
 	var producer sarama.SyncProducer
 	var err error
 
 	operation := func() error {
-		producer, err = router.NewProducer(kafkaConfig)
+		producer, err = router.NewProducer(kafkaConfig, tuning)
 		if err != nil {
 			return fmt.Errorf("could not create producer: %v", err)
 		}
@@ -259,12 +298,12 @@ func createProducerWithRetry(ctx context.Context, kafkaConfig *schemas.KafkaInfo
 	return producer, err
 }
 
-func createConsumerClientWithRetry(ctx context.Context, kafkaConfig *schemas.KafkaInfo, consumerConfig *schemas.ConsumerConfig) (sarama.Client, error) {
+func createConsumerClientWithRetry(ctx context.Context, kafkaConfig *schemas.KafkaInfo, consumerConfig *schemas.ConsumerConfig, tuning *router.Tuning) (sarama.Client, error) {
 	var consumerClient sarama.Client
 	var err error
 
 	operation := func() error {
-		consumerClient, err = router.NewConsumerClient(kafkaConfig, consumerConfig)
+		consumerClient, err = router.NewConsumerClient(kafkaConfig, consumerConfig, tuning)
 		if err != nil {
 			return fmt.Errorf("could not create consumer for topics %v: %v", consumerConfig.Topics, err)
 		}

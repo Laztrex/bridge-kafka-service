@@ -72,7 +72,7 @@ func TestPublishHandler_UnknownTopic(t *testing.T) {
 }
 
 func TestResponsePublish_PublishesAndAcks(t *testing.T) {
-	drainPublishChannel()
+	q := transport.NewResponseQueue()
 	producer := mocksarama.NewSyncProducer(t)
 	mocksarama.ExpectSendAndSucceed(producer)
 	reg := router.NewProducerRegistry()
@@ -99,12 +99,12 @@ func TestResponsePublish_PublishesAndAcks(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); ResponsePublish(ctx, newLogger(t), reg) }()
+	go func() { defer close(done); ResponsePublish(ctx, q, 1, newLogger(t), reg) }()
 
-	transport.PublishChannel <- ev("resp", skipConf)
-	transport.PublishChannel <- ev("missing", skipConf) // no producer, skip: failed and settled
-	fallback := ev("missing", retryConf)                // no producer, retry: defensive fallback
-	transport.PublishChannel <- fallback
+	q <- ev("resp", skipConf)
+	q <- ev("missing", skipConf)         // no producer, skip: failed and settled
+	fallback := ev("missing", retryConf) // no producer, retry: defensive fallback
+	q <- fallback
 
 	for i := 0; i < 3; i++ {
 		select {
@@ -170,10 +170,11 @@ func TestResponseServiceEventHasNonZeroDuration(t *testing.T) {
 	}
 	e.SetAck(func() { acked <- struct{}{} })
 
+	q := transport.NewResponseQueue()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); ResponsePublish(ctx, l, reg) }()
-	transport.PublishChannel <- e
+	go func() { defer close(done); ResponsePublish(ctx, q, 1, l, reg) }()
+	q <- e
 	select {
 	case <-acked:
 	case <-time.After(3 * time.Second):

@@ -10,7 +10,6 @@ import (
 
 	"github.com/IBM/sarama"
 	"github.com/rs/zerolog/log"
-	"gopkg.in/yaml.v3"
 
 	"bridge-kafka-service/internal/codec"
 	"bridge-kafka-service/internal/consts"
@@ -26,11 +25,6 @@ var (
 	consumerConfigPath = consts.ConfPathConsumer
 )
 
-type configConsumerUpdater struct {
-	Version                   string
-	OffsetsAutoCommitInterval time.Duration `yaml:"OffsetsAutoCommitInterval"`
-}
-
 type Consumer struct {
 	config    *schemas.ConsumerConfig
 	logger    *observability.FileTransactionLogger
@@ -40,7 +34,8 @@ type Consumer struct {
 }
 
 // RunSubscription runs the consume loop and the response handler of one subscription until
-// parent is cancelled or consumption ends. Each value on toggle flips pause/resume. On stop,
+// parent is cancelled or consumption ends; responses go to queue, the pipeline's own
+// publication queue (nil when the stanza has no response_topic). Each value on toggle flips pause/resume. On stop,
 // consumption is cancelled before the event channel is closed, since ConsumeClaim may still send.
 // A non-nil return means a permanent inability to start consuming (the upstream cannot be
 // constructed, the consumer group cannot be created): the error names the stanza's topics and
@@ -51,6 +46,7 @@ func RunSubscription(
 	toggle <-chan struct{},
 	consumerClient sarama.Client,
 	consumerConfig *schemas.ConsumerConfig,
+	queue chan<- *schemas.ConsumerEvent,
 	logger *observability.FileTransactionLogger,
 ) error {
 	consumptionIsPaused := false
@@ -92,9 +88,9 @@ func RunSubscription(
 	go func() {
 		defer wg.Done()
 		if consumerConfig.Service.MaxConn > 0 {
-			transport.ConsumerResponseSlow(logger, consumerConfig, upstream, ch, processingCtx)
+			transport.ConsumerResponseSlow(logger, consumerConfig, upstream, ch, queue, processingCtx)
 		} else {
-			transport.ConsumerResponseFast(logger, consumerConfig, upstream, ch, processingCtx)
+			transport.ConsumerResponseFast(logger, consumerConfig, upstream, ch, queue, processingCtx)
 		}
 		log.Info().Msg("response handler terminated")
 	}()
@@ -291,11 +287,12 @@ func (k *Consumer) ConsumeClaim(
 	}
 }
 
-// NewConsumerClient builds a sarama.Client wired with the application's TLS
-// settings and consumer-group tunables pulled from YAML configuration. Auto-commit is always on:
-// settlement only marks offsets, which sarama sends to the broker only when auto-commit is enabled.
-// TODO: move the rebalance strategy to the config yaml.
-func NewConsumerClient(conf *schemas.KafkaInfo, consumerConfig *schemas.ConsumerConfig) (sarama.Client, error) {
+// NewConsumerClient builds a sarama.Client wired with the application's TLS settings: code
+// defaults first (range rebalance strategy, 60s session timeout, 10s heartbeat, 10s max
+// processing time), then the consumer tuning loaded at startup, which overrides them. Auto-commit
+// is always on: settlement only marks offsets, which sarama sends to the broker only when
+// auto-commit is enabled.
+func NewConsumerClient(conf *schemas.KafkaInfo, consumerConfig *schemas.ConsumerConfig, tuning *Tuning) (sarama.Client, error) {
 	cfg := sarama.NewConfig()
 	version, err := sarama.ParseKafkaVersion(conf.Version)
 	if err != nil {
@@ -310,24 +307,8 @@ func NewConsumerClient(conf *schemas.KafkaInfo, consumerConfig *schemas.Consumer
 	cfg.Consumer.Group.Heartbeat.Interval = 10 * time.Second
 	cfg.Consumer.MaxProcessingTime = 10 * time.Second
 
-	raw, err := os.ReadFile(consumerConfigPath)
-	if err != nil {
-		return nil, fmt.Errorf("unable to locate configuration file: %w", err)
-	}
-
-	err = yaml.Unmarshal(raw, &cfg)
-	if err != nil {
-		return nil, fmt.Errorf("unable to parse configuration: %w", err)
-	}
-
-	cfgUpd := configConsumerUpdater{}
-	err = yaml.Unmarshal(raw, &cfgUpd)
-	if err != nil {
-		return nil, fmt.Errorf("unable to parse configuration: %w", err)
-	}
-
-	if cfgUpd.OffsetsAutoCommitInterval > 0 {
-		cfg.Consumer.Offsets.AutoCommit.Interval = cfgUpd.OffsetsAutoCommitInterval
+	if err := tuning.apply(cfg); err != nil {
+		return nil, err
 	}
 	cfg.Consumer.Offsets.AutoCommit.Enable = true
 

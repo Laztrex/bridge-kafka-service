@@ -64,6 +64,10 @@ At every step the service writes `controller_kafka_*` metrics to a file and audi
   non-transient error (for example a record too large for the broker) is settled
   as a failure. On shutdown the wait ends, an unpublished response is not settled
   and its record is redelivered.
+- **Each pipeline publishes its own responses.** Every stanza with a `response_topic`
+  has its own publish queue (1000 responses) and writes up to 16 responses at once
+  (`max_conn` if lower, so a `max_conn: 1` pipeline writes one at a time, in order).
+  A response topic that is slow or rejects writes holds back only its own pipeline.
 - **Upstream failures follow `on_failure`.** A failure is only "unavailable / timeout";
   any HTTP status or gRPC status is a response. `skip` (default) records a failure and
   commits the offset. `retry` holds the offset and repeats the call with backoff until

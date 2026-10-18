@@ -7,8 +7,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,9 +21,11 @@ import (
 
 	"bridge-kafka-service/internal/config"
 	"bridge-kafka-service/internal/consts"
+	"bridge-kafka-service/internal/handlers"
 	"bridge-kafka-service/internal/observability"
 	"bridge-kafka-service/internal/router"
 	"bridge-kafka-service/internal/schemas"
+	"bridge-kafka-service/internal/transport"
 	"bridge-kafka-service/testutil/mocksarama"
 )
 
@@ -110,11 +114,11 @@ func TestCloseProducerClosesSharedProducerOnce(t *testing.T) {
 func TestStartProducerRegistersEveryTopic(t *testing.T) {
 	p := &countingProducer{}
 	old := newProducerWithRetry
-	newProducerWithRetry = func(context.Context, *schemas.KafkaInfo) (sarama.SyncProducer, error) { return p, nil }
+	newProducerWithRetry = func(context.Context, *schemas.KafkaInfo, *router.Tuning) (sarama.SyncProducer, error) { return p, nil }
 	t.Cleanup(func() { newProducerWithRetry = old })
 	reg := router.NewProducerRegistry()
 
-	require.NoError(t, startProducer(context.Background(), &schemas.KafkaInfo{Producers: []*schemas.ProducerConfig{{Topic: "a"}, {Topic: "b"}}}, reg))
+	require.NoError(t, startProducer(context.Background(), &schemas.KafkaInfo{Producers: []*schemas.ProducerConfig{{Topic: "a"}, {Topic: "b"}}}, nil, reg))
 
 	for _, topic := range []string{"a", "b"} {
 		got, ok := reg.Lookup(topic)
@@ -126,20 +130,22 @@ func TestStartProducerRegistersEveryTopic(t *testing.T) {
 func TestStartProducerReturnsItsErrorAndRegistersNothing(t *testing.T) {
 	reg := router.NewProducerRegistry()
 
-	require.NoError(t, startProducer(context.Background(), &schemas.KafkaInfo{}, reg), "no producers: nothing to fail")
+	require.NoError(t, startProducer(context.Background(), &schemas.KafkaInfo{}, nil, reg), "no producers: nothing to fail")
 	assert.False(t, reg.Ready())
 
 	old := newProducerWithRetry
-	newProducerWithRetry = func(context.Context, *schemas.KafkaInfo) (sarama.SyncProducer, error) { return nil, errors.New("down") }
+	newProducerWithRetry = func(context.Context, *schemas.KafkaInfo, *router.Tuning) (sarama.SyncProducer, error) {
+		return nil, errors.New("down")
+	}
 	t.Cleanup(func() { newProducerWithRetry = old })
 
-	err := startProducer(context.Background(), &schemas.KafkaInfo{Producers: []*schemas.ProducerConfig{{Topic: "a"}}}, reg)
+	err := startProducer(context.Background(), &schemas.KafkaInfo{Producers: []*schemas.ProducerConfig{{Topic: "a"}}}, nil, reg)
 	require.Error(t, err)
 	assert.False(t, reg.Ready(), "a permanent failure registers nothing")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	assert.Error(t, startProducer(ctx, &schemas.KafkaInfo{Producers: []*schemas.ProducerConfig{{Topic: "a"}}}, reg),
+	assert.Error(t, startProducer(ctx, &schemas.KafkaInfo{Producers: []*schemas.ProducerConfig{{Topic: "a"}}}, nil, reg),
 		"a cancelled window is still an error; the caller checks ctx")
 	assert.False(t, reg.Ready())
 }
@@ -255,10 +261,10 @@ func TestConnect_ConsumerPermanentFailureReturnsError(t *testing.T) {
 func subscriptionFailureSeams(t *testing.T, run func(context.Context) error) {
 	t.Helper()
 	oldClient, oldRun := newConsumerClientWithRetry, runSubscription
-	newConsumerClientWithRetry = func(context.Context, *schemas.KafkaInfo, *schemas.ConsumerConfig) (sarama.Client, error) {
+	newConsumerClientWithRetry = func(context.Context, *schemas.KafkaInfo, *schemas.ConsumerConfig, *router.Tuning) (sarama.Client, error) {
 		return mocksarama.NewFakeClient(), nil
 	}
-	runSubscription = func(parent context.Context, _ <-chan struct{}, _ sarama.Client, _ *schemas.ConsumerConfig, _ *observability.FileTransactionLogger) error {
+	runSubscription = func(parent context.Context, _ <-chan struct{}, _ sarama.Client, _ *schemas.ConsumerConfig, _ chan<- *schemas.ConsumerEvent, _ *observability.FileTransactionLogger) error {
 		return run(parent)
 	}
 	t.Cleanup(func() { newConsumerClientWithRetry, runSubscription = oldClient, oldRun })
@@ -320,6 +326,155 @@ func TestConnect_SubscriptionFailureDuringShutdownIsNotReported(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("Connect did not return after cancellation")
 	}
+}
+
+// Each stanza with a response_topic gets its own queue and publishers; a stanza without one gets
+// neither, and shutdown returns only after every publisher has drained.
+func TestConnect_EachResponseTopicStanzaGetsItsOwnPublisher(t *testing.T) {
+	wrap := connectEnv(t, time.Minute)
+	oldProducer, oldClient, oldRun, oldPublish := newProducerWithRetry, newConsumerClientWithRetry, runSubscription, responsePublish
+	t.Cleanup(func() {
+		newProducerWithRetry, newConsumerClientWithRetry, runSubscription, responsePublish = oldProducer, oldClient, oldRun, oldPublish
+	})
+	newProducerWithRetry = func(context.Context, *schemas.KafkaInfo, *router.Tuning) (sarama.SyncProducer, error) {
+		return mocksarama.NewSyncProducer(t), nil
+	}
+	newConsumerClientWithRetry = func(context.Context, *schemas.KafkaInfo, *schemas.ConsumerConfig, *router.Tuning) (sarama.Client, error) {
+		return mocksarama.NewFakeClient(), nil
+	}
+
+	var mu sync.Mutex
+	queueOf := map[string]chan<- *schemas.ConsumerEvent{}
+	var subscribed sync.WaitGroup
+	subscribed.Add(3)
+	runSubscription = func(parent context.Context, _ <-chan struct{}, _ sarama.Client, conf *schemas.ConsumerConfig, queue chan<- *schemas.ConsumerEvent, _ *observability.FileTransactionLogger) error {
+		mu.Lock()
+		queueOf[conf.Topics[0]] = queue
+		mu.Unlock()
+		subscribed.Done()
+		<-parent.Done()
+		return nil
+	}
+	var workers []int
+	var drained atomic.Int32
+	responsePublish = func(ctx context.Context, _ <-chan *schemas.ConsumerEvent, n int, _ schemas.TransactionLogger, _ handlers.ProducerLookup) {
+		mu.Lock()
+		workers = append(workers, n)
+		mu.Unlock()
+		<-ctx.Done()
+		time.Sleep(50 * time.Millisecond)
+		drained.Add(1)
+	}
+
+	cfg := &schemas.KafkaInfo{
+		Brokers:   []string{freeAddr(t)},
+		Version:   "2.3.0",
+		Producers: []*schemas.ProducerConfig{{Topic: "out-a"}, {Topic: "out-b"}},
+		Consumers: []*schemas.ConsumerConfig{
+			{Topics: []string{"a"}, Group: "g", ClientId: "c", ResponseTopic: "out-a",
+				Service: schemas.HostConfig{Name: "svc", Port: "1", Path: "/", MaxConn: 1}},
+			{Topics: []string{"b"}, Group: "g", ClientId: "c", ResponseTopic: "out-b",
+				Service: schemas.HostConfig{Name: "svc", Port: "1", Path: "/"}},
+			{Topics: []string{"c"}, Group: "g", ClientId: "c",
+				Service: schemas.HostConfig{Name: "svc", Port: "1", Path: "/"}},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Connect(ctx, wrap(cfg)) }()
+
+	subscribed.Wait()
+	mu.Lock()
+	assert.NotNil(t, queueOf["a"])
+	assert.NotNil(t, queueOf["b"])
+	assert.True(t, queueOf["a"] != queueOf["b"], "each pipeline has its own queue")
+	assert.Nil(t, queueOf["c"], "a stanza without response_topic gets no queue")
+	assert.ElementsMatch(t, []int{1, transport.MaxPublishersPerPipeline}, workers,
+		"one publisher set per response stanza, sized by its concurrency")
+	mu.Unlock()
+
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+		assert.Equal(t, int32(2), drained.Load(), "Connect returns only after every publisher has drained")
+	case <-time.After(15 * time.Second):
+		t.Fatal("Connect did not return after cancellation")
+	}
+}
+
+// tuningDir switches the working directory to an empty one holding only the given files
+// under configs/, so Connect sees exactly those tuning files.
+func tuningDir(t *testing.T, files map[string]string) {
+	t.Helper()
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "configs"), 0o755))
+	for name, content := range files {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "configs", name), []byte(content), 0o600))
+	}
+	t.Chdir(dir)
+}
+
+func TestConnect_MissingProducerTuningStopsStartup(t *testing.T) {
+	wrap := connectEnv(t, time.Minute)
+	tuningDir(t, map[string]string{"config_consumer.yaml": "consumer:\n  return:\n    errors: true\n"})
+	var producerCalls atomic.Int32
+	old := newProducerWithRetry
+	newProducerWithRetry = func(context.Context, *schemas.KafkaInfo, *router.Tuning) (sarama.SyncProducer, error) {
+		producerCalls.Add(1)
+		return nil, errors.New("must not be called")
+	}
+	t.Cleanup(func() { newProducerWithRetry = old })
+
+	cfg := &schemas.KafkaInfo{
+		Brokers:   []string{freeAddr(t)},
+		Version:   "2.3.0",
+		Producers: []*schemas.ProducerConfig{{Topic: "out"}},
+	}
+	start := time.Now()
+	err := Connect(context.Background(), wrap(cfg))
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "invalid Kafka producer tuning")
+	assert.ErrorContains(t, err, "config_producer.yaml")
+	assert.Less(t, time.Since(start), 5*time.Second, "a missing file is not retried")
+	assert.Zero(t, producerCalls.Load(), "startup stops before any client is created")
+}
+
+func TestConnect_TuningOfAnUnusedClientIsNotRequired(t *testing.T) {
+	wrap := connectEnv(t, time.Minute)
+	tuningDir(t, map[string]string{"config_consumer.yaml": "consumer:\n  return:\n    errors: true\n"})
+	started := make(chan struct{})
+	subscriptionFailureSeams(t, func(parent context.Context) error {
+		close(started)
+		<-parent.Done()
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Connect(ctx, wrap(subscriptionFailureConfig(t))) }()
+	select {
+	case <-started:
+	case err := <-done:
+		t.Fatalf("Connect stopped although no producer needs config_producer.yaml: %v", err)
+	case <-time.After(15 * time.Second):
+		t.Fatal("subscription did not start")
+	}
+	cancel()
+	assert.NoError(t, <-done)
+}
+
+func TestConnect_UnknownRebalanceStrategyStopsStartup(t *testing.T) {
+	wrap := connectEnv(t, time.Minute)
+	tuningDir(t, map[string]string{"config_consumer.yaml": "consumer:\n  group:\n    rebalance:\n      strategy: fair\n"})
+
+	err := Connect(context.Background(), wrap(subscriptionFailureConfig(t)))
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "invalid Kafka consumer tuning")
+	assert.ErrorContains(t, err, `"fair"`)
 }
 
 func TestConnect_GracefulShutdownOnContextCancel(t *testing.T) {
@@ -399,19 +554,19 @@ func failingProducerSeams(t *testing.T, delay time.Duration) *atomic.Int32 {
 	t.Helper()
 
 	oldProducer := newProducerWithRetry
-	newProducerWithRetry = func(context.Context, *schemas.KafkaInfo) (sarama.SyncProducer, error) {
+	newProducerWithRetry = func(context.Context, *schemas.KafkaInfo, *router.Tuning) (sarama.SyncProducer, error) {
 		time.Sleep(delay)
 		return nil, errors.New("broker unreachable")
 	}
 
 	oldClient := newConsumerClientWithRetry
-	newConsumerClientWithRetry = func(context.Context, *schemas.KafkaInfo, *schemas.ConsumerConfig) (sarama.Client, error) {
+	newConsumerClientWithRetry = func(context.Context, *schemas.KafkaInfo, *schemas.ConsumerConfig, *router.Tuning) (sarama.Client, error) {
 		return mocksarama.NewFakeClient(), nil
 	}
 
 	var runs atomic.Int32
 	oldRun := runSubscription
-	runSubscription = func(parent context.Context, _ <-chan struct{}, _ sarama.Client, _ *schemas.ConsumerConfig, _ *observability.FileTransactionLogger) error {
+	runSubscription = func(parent context.Context, _ <-chan struct{}, _ sarama.Client, _ *schemas.ConsumerConfig, _ chan<- *schemas.ConsumerEvent, _ *observability.FileTransactionLogger) error {
 		runs.Add(1)
 		<-parent.Done()
 		return nil
@@ -445,7 +600,7 @@ func pollStatus(t *testing.T, addr string) string {
 func TestConnect_ProducerPermanentFailureIsFatalWhenResponsesAreExpected(t *testing.T) {
 	wrap := connectEnv(t, 300*time.Millisecond)
 	oldProducer := newProducerWithRetry
-	newProducerWithRetry = func(context.Context, *schemas.KafkaInfo) (sarama.SyncProducer, error) {
+	newProducerWithRetry = func(context.Context, *schemas.KafkaInfo, *router.Tuning) (sarama.SyncProducer, error) {
 		return nil, errors.New("broker unreachable")
 	}
 	t.Cleanup(func() { newProducerWithRetry = oldProducer })

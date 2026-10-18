@@ -32,12 +32,12 @@ var trackingHeaders = []string{
 	consts.HeaderRequestIdKey, consts.HeaderRequestTimeKey, consts.HeaderTraceIdKey, consts.HeaderClientId,
 }
 
-// publishUpstreamResponse queues the response event for the response topic (if any) and hands
-// it the ack. The event carries the stanza config, so the response publisher can apply its
+// publishUpstreamResponse queues the response event in the pipeline's queue for the response
+// topic (if any) and hands it the ack. The event carries the stanza config, so the response publisher can apply its
 // failure policy. On a full queue the response is dropped, unless wait is set (on_failure: retry):
 // then it waits until abandon is cancelled and returns errPublishAbandoned, keeping the ack.
 // Tracking headers are always set under their wire names, even if the upstream did not echo them.
-func publishUpstreamResponse(abandon context.Context, msg *schemas.ConsumerEvent, resp UpstreamResponse, wait bool) error {
+func publishUpstreamResponse(abandon context.Context, msg *schemas.ConsumerEvent, resp UpstreamResponse, queue chan<- *schemas.ConsumerEvent, wait bool) error {
 	if msg.ResponseTopic == "" {
 		return nil
 	}
@@ -87,9 +87,9 @@ func publishUpstreamResponse(abandon context.Context, msg *schemas.ConsumerEvent
 
 	if wait {
 		select {
-		case PublishChannel <- publishEvent:
+		case queue <- publishEvent:
 			log.Debug().Str(consts.HeaderRequestIdKey, msg.Values.RequestId).
-				Msg("response event sent to publish channel")
+				Msg("response event sent to publish queue")
 		case <-abandon.Done():
 			msg.SetAck(publishEvent.TakeAck())
 			return errPublishAbandoned
@@ -98,12 +98,12 @@ func publishUpstreamResponse(abandon context.Context, msg *schemas.ConsumerEvent
 	}
 
 	select {
-	case PublishChannel <- publishEvent:
+	case queue <- publishEvent:
 		log.Debug().Str(consts.HeaderRequestIdKey, msg.Values.RequestId).
-			Msg("response event sent to publish channel")
+			Msg("response event sent to publish queue")
 	default:
 		log.Warn().Str(consts.HeaderRequestIdKey, msg.Values.RequestId).
-			Msg("publish channel is full, dropping response event")
+			Msg("publish queue is full, dropping response event")
 		publishEvent.Ack()
 	}
 	return nil

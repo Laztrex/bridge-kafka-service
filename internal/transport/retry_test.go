@@ -81,13 +81,13 @@ func TestRetryBackoff_DoublesUpToTheCap(t *testing.T) {
 }
 
 func TestRetry_OutageThenRecoveryDeliversOnceWithOneOutcome(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	transport.FastRetries(t, time.Millisecond, 5*time.Millisecond)
 	logs := captureLog(t)
 	up := &scriptedUpstream{fail: func(call int32) bool { return call <= 3 }}
 	ev, acks := newEvent("resp")
 
-	transport.SendToServiceRetrying(context.Background(), logger(t), up, ev, time.Second, transport.NewRetryState())
+	transport.SendToServiceRetrying(context.Background(), logger(t), up, ev, q, time.Second, transport.NewRetryState())
 
 	assert.Equal(t, int32(4), up.calls.Load())
 	assert.Equal(t, 1, ev.Event.Success)
@@ -95,25 +95,24 @@ func TestRetry_OutageThenRecoveryDeliversOnceWithOneOutcome(t *testing.T) {
 	assert.Equal(t, 3, logs.count("upstream call failed, retrying"))
 	assert.Zero(t, *acks, "the offset waits for the response to be published")
 	select {
-	case out := <-transport.PublishChannel:
+	case out := <-q:
 		out.Ack()
 		assert.Equal(t, 1, *acks)
 	case <-time.After(time.Second):
 		t.Fatal("response event not published")
 	}
-	assert.Empty(t, transport.PublishChannel, "published exactly once")
+	assert.Empty(t, q, "published exactly once")
 }
 
 func TestRetry_ErrorResponseIsNotRetried(t *testing.T) {
-	drainPublish()
+	q := transport.NewResponseQueue()
 	up := &fakeUpstream{resp: transport.UpstreamResponse{Body: []byte(`{"error":"busy"}`)}}
 	ev, _ := newEvent("resp")
 
-	transport.SendToServiceRetrying(context.Background(), logger(t), up, ev, time.Second, transport.NewRetryState())
+	transport.SendToServiceRetrying(context.Background(), logger(t), up, ev, q, time.Second, transport.NewRetryState())
 
 	assert.Equal(t, 1, ev.Event.Success)
-	assert.Len(t, transport.PublishChannel, 1)
-	drainPublish()
+	assert.Len(t, q, 1)
 }
 
 func TestRetry_ShutdownDuringWaitLeavesTheRecordUnsettled(t *testing.T) {
@@ -125,7 +124,7 @@ func TestRetry_ShutdownDuringWaitLeavesTheRecordUnsettled(t *testing.T) {
 
 	go func() {
 		defer close(done)
-		transport.SendToServiceRetrying(abandon, logger(t), up, ev, time.Second, transport.NewRetryState())
+		transport.SendToServiceRetrying(abandon, logger(t), up, ev, nil, time.Second, transport.NewRetryState())
 	}()
 	require.Eventually(t, func() bool { return up.calls.Load() == 1 }, time.Second, 5*time.Millisecond)
 	giveUp()
@@ -152,7 +151,7 @@ func TestRetry_PoisonRecordIsSkippedWhileOthersSucceed(t *testing.T) {
 	}}
 	ev, acks := newEvent("")
 
-	transport.SendToServiceRetrying(context.Background(), logger(t), up, ev, time.Second, state)
+	transport.SendToServiceRetrying(context.Background(), logger(t), up, ev, nil, time.Second, state)
 
 	assert.Equal(t, int32(transport.PoisonAttempts()), up.calls.Load())
 	assert.Equal(t, 1, ev.Event.Failure)
@@ -173,7 +172,7 @@ func TestRetry_NothingIsSkippedWhileNoCallSucceeds(t *testing.T) {
 	}}
 	ev, acks := newEvent("")
 
-	transport.SendToServiceRetrying(abandon, logger(t), up, ev, time.Second, transport.NewRetryState())
+	transport.SendToServiceRetrying(abandon, logger(t), up, ev, nil, time.Second, transport.NewRetryState())
 
 	assert.GreaterOrEqual(t, up.calls.Load(), int32(calls), "kept retrying past the poison threshold")
 	assert.Zero(t, ev.Event.Failure, "an outage never skips a record")
@@ -214,7 +213,7 @@ func TestRetry_SlotsRetryingStopFurtherCalls(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		transport.ConsumerResponseSlow(logger(t), conf, up, ch, context.Background())
+		transport.ConsumerResponseSlow(logger(t), conf, up, ch, nil, context.Background())
 	}()
 
 	time.Sleep(100 * time.Millisecond)
@@ -236,24 +235,23 @@ func (f upstreamFunc) Call(_ context.Context, req transport.UpstreamRequest) (tr
 	return f(req)
 }
 
-func fillPublishChannel(t *testing.T) {
-	t.Helper()
-	drainPublish()
-	for range cap(transport.PublishChannel) {
-		transport.PublishChannel <- &schemas.ConsumerEvent{}
+// fillQueue fills a pipeline's response queue so the next hand-off finds it full.
+func fillQueue(q chan *schemas.ConsumerEvent) {
+	for range cap(q) {
+		q <- &schemas.ConsumerEvent{}
 	}
-	t.Cleanup(drainPublish)
 }
 
 func TestRetry_FullPublishChannelWaitsInsteadOfDropping(t *testing.T) {
-	fillPublishChannel(t)
+	q := transport.NewResponseQueue()
+	fillQueue(q)
 	up := &fakeUpstream{resp: transport.UpstreamResponse{Body: []byte(`{"ok":true}`)}}
 	ev, acks := newEvent("resp")
 	done := make(chan struct{})
 
 	go func() {
 		defer close(done)
-		transport.SendToServiceRetrying(context.Background(), logger(t), up, ev, time.Second, transport.NewRetryState())
+		transport.SendToServiceRetrying(context.Background(), logger(t), up, ev, q, time.Second, transport.NewRetryState())
 	}()
 	select {
 	case <-done:
@@ -262,13 +260,13 @@ func TestRetry_FullPublishChannelWaitsInsteadOfDropping(t *testing.T) {
 	}
 	assert.Zero(t, *acks)
 
-	<-transport.PublishChannel
+	<-q
 	<-done
 	assert.Equal(t, 1, ev.Event.Success)
 	assert.Zero(t, *acks, "settled only when the published response is acked")
 	var published *schemas.ConsumerEvent
-	for len(transport.PublishChannel) > 0 {
-		published = <-transport.PublishChannel
+	for len(q) > 0 {
+		published = <-q
 	}
 	require.NotNil(t, published)
 	published.Ack()
@@ -276,7 +274,8 @@ func TestRetry_FullPublishChannelWaitsInsteadOfDropping(t *testing.T) {
 }
 
 func TestRetry_ShutdownWhileWaitingForThePublishChannel(t *testing.T) {
-	fillPublishChannel(t)
+	q := transport.NewResponseQueue()
+	fillQueue(q)
 	up := &fakeUpstream{resp: transport.UpstreamResponse{Body: []byte(`{}`)}}
 	ev, acks := newEvent("resp")
 	abandon, giveUp := context.WithCancel(context.Background())
@@ -284,7 +283,7 @@ func TestRetry_ShutdownWhileWaitingForThePublishChannel(t *testing.T) {
 
 	go func() {
 		defer close(done)
-		transport.SendToServiceRetrying(abandon, logger(t), up, ev, time.Second, transport.NewRetryState())
+		transport.SendToServiceRetrying(abandon, logger(t), up, ev, q, time.Second, transport.NewRetryState())
 	}()
 	time.Sleep(20 * time.Millisecond)
 	giveUp()

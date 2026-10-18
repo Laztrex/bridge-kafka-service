@@ -255,6 +255,25 @@ Sequence diagram of a record's full path: [docs/flow.md](docs/flow.md).
 
 The application config is one YAML file: the `--config` flag, then `CONFIG_PATH` (environment, then the `.env` file in the working directory), otherwise `configs/config_app.yaml`. It is read once at startup. The Kafka client tunables `configs/config_consumer.yaml` and `configs/config_producer.yaml` are separate files read by the Kafka client as they are (sarama settings). One exception: offset auto-commit is always on, whatever `consumer.offsets.autocommit.enable` says, because settled offsets reach the broker only through it (`OffsetsAutoCommitInterval` sets how often). A group that has never committed starts from `offsets.initial`; after that a restart resumes after the last settled record.
 
+### Kafka client tunables
+
+`config_consumer.yaml` and `config_producer.yaml` hold sarama settings, written as sarama's field names in lower case (`net.maxopenrequests`, `consumer.group.session.timeout`). Both are loaded and checked once at startup, and only when their client is needed (the consumer file with an active consumer, the producer file with a producer):
+
+* a missing or broken file, or a value of the wrong type, **stops startup** with an error naming the file. Nothing is retried, because a broken file cannot fix itself;
+* an unknown key (a typo such as `maxopenrequest`, or a key in the wrong case such as `MaxOpenRequests`) is logged as a warning (`unknown tuning key net.maxopenrequest in configs/config_producer.yaml is ignored`) and ignored, so the sarama default stays;
+* a sarama setting that cannot be expressed in YAML (callbacks and plug-ins such as `producer.partitioner` or `net.sasl.tokenprovider`) is logged as a warning and ignored.
+
+Consumer group defaults set by the bridge, which the consumer file overrides:
+
+| Key | Default |
+|---|---|
+| `consumer.group.rebalance.strategy` | `range`; also `roundrobin`, `sticky`, `cooperative-sticky`. Any other value stops startup |
+| `consumer.group.session.timeout` | `60s` |
+| `consumer.group.heartbeat.interval` | `10s` |
+| `consumer.maxprocessingtime` | `10s` |
+
+Changing the rebalance strategy of a running group needs a restart of **every** instance of the group. Members with different strategies cannot join the same group: while old and new instances are mixed, joins fail with `InconsistentGroupProtocol`. Stop all instances, then start them with the new setting.
+
 ### Keys
 
 Values are defaults or examples.
@@ -397,7 +416,7 @@ A failure is only a transport failure: the service is unreachable, does not answ
 
 `retry` requires `service.max_conn > 0`, otherwise startup fails. When all `max_conn` slots are retrying, the pipeline stops reading Kafka until the service recovers, so an outage loses nothing. Each failed attempt is logged as a warning; metrics count only the final outcome of a record.
 
-With `retry` a response is never dropped either: when the internal publish queue (1000 responses) is full because Kafka writes are slow, the call waits for space instead of dropping the response and settling the offset (`skip` drops it with a warning). And when Kafka rejects the write itself, the response is republished with the same backoff (1s doubling up to 30s) until the broker accepts it: the offset is held and the upstream is not called again, so a broker outage stalls `retry` pipelines instead of losing their responses. Each failed attempt is logged as a warning; metrics and audit record only the final outcome. The exception is a non-transient publish error (for example, a record too large for the broker): it is recorded as a failure and the offset is settled, like a poison record. On shutdown the backoff wait ends and an unpublished response is not settled, so its record is redelivered after restart.
+With `retry` a response is never dropped either: when the pipeline's publish queue (1000 responses) is full because Kafka writes are slow, the call waits for space instead of dropping the response and settling the offset (`skip` drops it with a warning). And when Kafka rejects the write itself, the response is republished with the same backoff (1s doubling up to 30s) until the broker accepts it: the offset is held and the upstream is not called again, so a broker outage stalls `retry` pipelines instead of losing their responses. Each pipeline has its own publish queue and writes up to 16 responses at once (`max_conn` if lower, so a `max_conn: 1` pipeline writes one at a time, in order), so a response topic that is broken or slow holds back only the pipeline that writes to it, never the others. Each failed attempt is logged as a warning; metrics and audit record only the final outcome. The exception is a non-transient publish error (for example, a record too large for the broker): it is recorded as a failure and the offset is settled, like a poison record. On shutdown the backoff wait ends and an unpublished response is not settled, so its record is redelivered after restart.
 
 A record that fails 5 attempts **while other records of the same pipeline get answers** is treated as poison: a failure metric, a `poison` warning with its request id, the offset is settled. During an outage nothing is skipped. With `max_conn: 1` there are no other calls to compare with, so such a record is retried until the service answers.
 
