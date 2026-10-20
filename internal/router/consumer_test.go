@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"bridge-kafka-service/internal/consts"
 	"bridge-kafka-service/internal/observability"
 	"bridge-kafka-service/internal/schemas"
+	"bridge-kafka-service/internal/transport"
 	"bridge-kafka-service/testutil/fakeclock"
 	"bridge-kafka-service/testutil/metricsfile"
 	"bridge-kafka-service/testutil/mocksarama"
@@ -191,21 +193,27 @@ func TestRunSubscription_ProcessesMessagesTogglesPauseAndStopsOnCancel(t *testin
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	toggle := make(chan struct{}, 2)
+	pause := NewPause()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		RunSubscription(ctx, toggle, mocksarama.NewFakeClient(), conf, nil, newTestLogger(t))
+		RunSubscription(ctx, pause, mocksarama.NewFakeClient(), conf, nil, newTestLogger(t), nil)
 	}()
 
 	g.QueueMessage(&sarama.ConsumerMessage{Topic: "in", Offset: 3, Value: []byte(`{"q":1}`)})
 	require.Eventually(t, func() bool { return len(g.MarkedOffsets()) == 1 }, 5*time.Second, 10*time.Millisecond)
 	assert.Equal(t, []int64{3}, g.MarkedOffsets())
 
-	toggle <- struct{}{}
-	require.Eventually(t, func() bool { return g.PauseCount() == 1 }, 3*time.Second, 10*time.Millisecond)
-	toggle <- struct{}{}
-	require.Eventually(t, func() bool { return g.ResumeCount() == 1 }, 3*time.Second, 10*time.Millisecond)
+	pause.Toggle()
+	assert.Equal(t, 1, g.PauseCount(), "the subscription's group follows the shared pause")
+	g.QueueMessage(&sarama.ConsumerMessage{Topic: "in", Offset: 4, Value: []byte(`{"q":2}`)})
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, []int64{3}, g.MarkedOffsets(), "no record is handed out while paused")
+
+	pause.Toggle()
+	assert.Equal(t, 1, g.ResumeCount())
+	require.Eventually(t, func() bool { return len(g.MarkedOffsets()) == 2 }, 5*time.Second, 10*time.Millisecond,
+		"the held record is processed after resume")
 
 	cancel()
 	select {
@@ -225,7 +233,7 @@ func TestRunSubscription_SlowModeAndGroupCreationFailure(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		RunSubscription(context.Background(), nil, mocksarama.NewFakeClient(), conf, nil, newTestLogger(t))
+		RunSubscription(context.Background(), nil, mocksarama.NewFakeClient(), conf, nil, newTestLogger(t), nil)
 	}()
 	select {
 	case <-done:
@@ -239,7 +247,7 @@ func TestRunSubscription_SlowModeAndGroupCreationFailure(t *testing.T) {
 	done2 := make(chan struct{})
 	go func() {
 		defer close(done2)
-		RunSubscription(ctx, nil, mocksarama.NewFakeClient(), conf, nil, newTestLogger(t))
+		RunSubscription(ctx, nil, mocksarama.NewFakeClient(), conf, nil, newTestLogger(t), nil)
 	}()
 	g.QueueMessage(&sarama.ConsumerMessage{Topic: "in", Offset: 1, Value: []byte(`{}`)})
 	require.Eventually(t, func() bool { return len(g.MarkedOffsets()) == 1 }, 5*time.Second, 10*time.Millisecond)
@@ -255,7 +263,7 @@ func TestRunSubscription_StartFailuresReturnErrorsAndCleanStopReturnsNil(t *test
 	old := newConsumerGroup
 	newConsumerGroup = func(string, sarama.Client) (sarama.ConsumerGroup, error) { return nil, errors.New("no group") }
 	err := RunSubscription(context.Background(), nil, mocksarama.NewFakeClient(),
-		&schemas.ConsumerConfig{Topics: []string{"orders"}, Group: "g", Service: host}, nil, newTestLogger(t))
+		&schemas.ConsumerConfig{Topics: []string{"orders"}, Group: "g", Service: host}, nil, newTestLogger(t), nil)
 	newConsumerGroup = old
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "orders")
@@ -264,7 +272,7 @@ func TestRunSubscription_StartFailuresReturnErrorsAndCleanStopReturnsNil(t *test
 
 	badTarget := schemas.HostConfig{Name: "%zz", Port: "1", Protocol: schemas.ProtocolGRPC}
 	err = RunSubscription(context.Background(), nil, mocksarama.NewFakeClient(),
-		&schemas.ConsumerConfig{Topics: []string{"payments"}, Group: "g", Service: badTarget}, nil, newTestLogger(t))
+		&schemas.ConsumerConfig{Topics: []string{"payments"}, Group: "g", Service: badTarget}, nil, newTestLogger(t), nil)
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "payments")
 	assert.ErrorContains(t, err, "cannot create upstream")
@@ -273,7 +281,7 @@ func TestRunSubscription_StartFailuresReturnErrorsAndCleanStopReturnsNil(t *test
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	assert.NoError(t, RunSubscription(ctx, nil, mocksarama.NewFakeClient(),
-		&schemas.ConsumerConfig{Topics: []string{"in"}, Group: "g", Service: host}, nil, newTestLogger(t)))
+		&schemas.ConsumerConfig{Topics: []string{"in"}, Group: "g", Service: host}, nil, newTestLogger(t), nil))
 }
 
 func writeYAML(t *testing.T, content string) string {
@@ -492,7 +500,7 @@ func TestRunSubscription_ShutdownAbandonsHungCallsWithinTheDrainWindowAndKeepsTh
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		RunSubscription(ctx, nil, mocksarama.NewFakeClient(), conf, nil, newTestLogger(t))
+		RunSubscription(ctx, nil, mocksarama.NewFakeClient(), conf, nil, newTestLogger(t), nil)
 	}()
 	g.QueueMessage(&sarama.ConsumerMessage{Topic: "in", Offset: 7, Value: []byte(`{}`)})
 	select {
@@ -517,9 +525,9 @@ func TestOffsetTracker_MarksOnlyInOrder(t *testing.T) {
 	sess := &ctxSession{ctx: context.Background()}
 	tr := &offsetTracker{session: sess}
 
-	ack1 := tr.track(&sarama.ConsumerMessage{Offset: 1})
-	ack2 := tr.track(&sarama.ConsumerMessage{Offset: 2})
-	ack3 := tr.track(&sarama.ConsumerMessage{Offset: 3})
+	ack1, _ := tr.track(&sarama.ConsumerMessage{Offset: 1})
+	ack2, _ := tr.track(&sarama.ConsumerMessage{Offset: 2})
+	ack3, _ := tr.track(&sarama.ConsumerMessage{Offset: 3})
 
 	ack3()
 	ack2()
@@ -533,9 +541,314 @@ func TestOffsetTracker_AckIsIdempotent(t *testing.T) {
 	sess := &ctxSession{ctx: context.Background()}
 	tr := &offsetTracker{session: sess}
 
-	ack := tr.track(&sarama.ConsumerMessage{Offset: 7})
+	ack, _ := tr.track(&sarama.ConsumerMessage{Offset: 7})
 	ack()
 	ack()
 
 	assert.Equal(t, []int64{7}, sess.Marked())
+}
+
+// The ack and the abandon of one record share one outcome: whichever comes first wins.
+func TestOffsetTracker_AckAndAbandonFireOnce(t *testing.T) {
+	sess := &ctxSession{ctx: context.Background()}
+	tr := &offsetTracker{session: sess}
+
+	ack, abandon := tr.track(&sarama.ConsumerMessage{Offset: 1})
+	ack()
+	abandon()
+	assert.Equal(t, []int64{1}, sess.Marked())
+	assert.Zero(t, tr.waitSettled(0))
+
+	ack2, abandon2 := tr.track(&sarama.ConsumerMessage{Offset: 2})
+	abandon2()
+	ack2()
+	assert.Equal(t, []int64{1}, sess.Marked(), "an abandoned record is never marked")
+	assert.Zero(t, tr.waitSettled(0), "an abandoned record no longer counts as outstanding")
+}
+
+// An abandoned record stops marking in front of it: later records stay unmarked, so the
+// abandoned one is redelivered together with everything after it.
+func TestOffsetTracker_AbandonedRecordBlocksLaterMarks(t *testing.T) {
+	sess := &ctxSession{ctx: context.Background()}
+	tr := &offsetTracker{session: sess}
+
+	_, abandon1 := tr.track(&sarama.ConsumerMessage{Offset: 1})
+	ack2, _ := tr.track(&sarama.ConsumerMessage{Offset: 2})
+	abandon1()
+	ack2()
+
+	assert.Empty(t, sess.Marked())
+}
+
+func TestOffsetTracker_WaitSettled(t *testing.T) {
+	tr := &offsetTracker{session: &ctxSession{ctx: context.Background()}}
+	ack, _ := tr.track(&sarama.ConsumerMessage{Offset: 1})
+	_, _ = tr.track(&sarama.ConsumerMessage{Offset: 2})
+
+	time.AfterFunc(50*time.Millisecond, ack)
+	began := time.Now()
+	assert.Equal(t, 1, tr.waitSettled(300*time.Millisecond), "one record never settles")
+	assert.GreaterOrEqual(t, time.Since(began), 300*time.Millisecond, "the bound is waited out")
+
+	tr2 := &offsetTracker{session: &ctxSession{ctx: context.Background()}}
+	ack3, _ := tr2.track(&sarama.ConsumerMessage{Offset: 3})
+	time.AfterFunc(50*time.Millisecond, ack3)
+	began = time.Now()
+	assert.Zero(t, tr2.waitSettled(5*time.Second))
+	assert.Less(t, time.Since(began), 2*time.Second, "the wait ends as soon as everything settled")
+}
+
+// blockingUpstream answers each call only when release is closed (or the call is cancelled), and
+// reports every call start on started.
+func blockingUpstream(t *testing.T) (host schemas.HostConfig, started chan struct{}, release chan struct{}) {
+	t.Helper()
+	started, release = make(chan struct{}, 64), make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		started <- struct{}{}
+		select {
+		case <-release:
+			_, _ = w.Write([]byte(`{}`))
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(srv.Close)
+	u, _ := url.Parse(srv.URL)
+	return schemas.HostConfig{Name: u.Hostname(), Port: u.Port(), Path: "/predict", Timeout: 30 * time.Second}, started, release
+}
+
+func waitStarted(t *testing.T, started <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the upstream call never started")
+	}
+}
+
+// A call that finishes inside the drain window on shutdown must have its offset committed before
+// the session is released, so the record is not redelivered.
+func TestRunSubscription_CallFinishingInTheDrainWindowIsMarkedBeforeRelease(t *testing.T) {
+	g := useFakeGroup(t)
+	host, started, release := blockingUpstream(t)
+	conf := &schemas.ConsumerConfig{Topics: []string{"in"}, Group: "g", Service: host, DrainWindow: 3 * time.Second}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = RunSubscription(ctx, nil, mocksarama.NewFakeClient(), conf, nil, newTestLogger(t), nil)
+	}()
+	g.QueueMessage(&sarama.ConsumerMessage{Topic: "in", Offset: 9, Value: []byte(`{}`)})
+	waitStarted(t, started)
+
+	cancel()
+	time.AfterFunc(200*time.Millisecond, func() { close(release) })
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("RunSubscription did not stop")
+	}
+
+	assert.Equal(t, []int64{9}, g.MarkedOffsets(), "the record finished in the drain window and must not be redelivered")
+}
+
+// runSubscriptionInBackground starts RunSubscription and returns a stop function that cancels it
+// and waits for it to return.
+func runSubscriptionInBackground(t *testing.T, conf *schemas.ConsumerConfig) func() {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = RunSubscription(ctx, nil, mocksarama.NewFakeClient(), conf, nil, newTestLogger(t), nil)
+	}()
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("RunSubscription did not stop")
+			}
+		})
+	}
+	t.Cleanup(stop)
+	return stop
+}
+
+// A call in flight when a rebalance ends the session, and finishing within the bound, is marked
+// before the session is released, so the partition's next owner does not get it again.
+func TestRunSubscription_InFlightCallDuringRebalanceIsMarkedBeforeRelease(t *testing.T) {
+	g := useFakeGroup(t)
+	host, started, release := blockingUpstream(t)
+	runSubscriptionInBackground(t, &schemas.ConsumerConfig{Topics: []string{"in"}, Group: "g", Service: host, DrainWindow: 3 * time.Second})
+	g.QueueMessage(&sarama.ConsumerMessage{Topic: "in", Offset: 4, Value: []byte(`{}`)})
+	waitStarted(t, started)
+
+	g.EndSession()
+	time.AfterFunc(200*time.Millisecond, func() { close(release) })
+
+	require.Eventually(t, func() bool { return len(g.MarkedOffsets()) == 1 }, 5*time.Second, 10*time.Millisecond)
+	assert.Equal(t, []int64{4}, g.MarkedOffsets())
+}
+
+// A call that does not finish within the bound does not hold the rebalance: the claim returns
+// after the bound with a warning, and the record stays unmarked for redelivery.
+func TestRunSubscription_RebalanceWaitIsBounded(t *testing.T) {
+	g := useFakeGroup(t)
+	logs := captureWarnings(t)
+	host, started, release := blockingUpstream(t)
+	t.Cleanup(func() { close(release) })
+	runSubscriptionInBackground(t, &schemas.ConsumerConfig{Topics: []string{"in"}, Group: "g", Service: host, DrainWindow: 300 * time.Millisecond})
+	g.QueueMessage(&sarama.ConsumerMessage{Topic: "in", Offset: 5, Value: []byte(`{}`)})
+	waitStarted(t, started)
+
+	began := time.Now()
+	g.EndSession()
+
+	require.Eventually(t, func() bool { return strings.Contains(logs.String(), "still in flight") }, 5*time.Second, 10*time.Millisecond)
+	assert.Less(t, time.Since(began), 2*time.Second, "bounded by the drain window, not by the 30s call timeout")
+	assert.Contains(t, logs.String(), "1 records still in flight")
+	assert.Empty(t, g.MarkedOffsets())
+}
+
+// On a rebalance, records of the ended session that wait behind a busy slot are not sent to the
+// upstream, and being abandoned they do not hold the claim: it returns as soon as the in-flight
+// call settles, long before the bound.
+func TestRunSubscription_BufferedRecordsOfARevokedPartitionAreNotSent(t *testing.T) {
+	g := useFakeGroup(t)
+	host, started, release := blockingUpstream(t)
+	host.MaxConn = 1
+	runSubscriptionInBackground(t, &schemas.ConsumerConfig{Topics: []string{"in"}, Group: "g", Service: host, DrainWindow: 5 * time.Second})
+	for i := range 21 {
+		g.QueueMessage(&sarama.ConsumerMessage{Topic: "in", Offset: int64(i), Value: []byte(`{}`)})
+	}
+	waitStarted(t, started)
+	time.Sleep(200 * time.Millisecond) // let the claim hand all 21 records to the pipeline
+
+	began := time.Now()
+	g.EndSession()
+	time.AfterFunc(100*time.Millisecond, func() { close(release) })
+
+	require.Eventually(t, func() bool { return g.Sessions() == 2 }, 4*time.Second, 10*time.Millisecond)
+	assert.Less(t, time.Since(began), 2*time.Second, "abandoned records must not hold the claim until the bound")
+	time.Sleep(200 * time.Millisecond)
+	assert.Len(t, started, 0, "none of the buffered records reached the upstream")
+	assert.Equal(t, []int64{0}, g.MarkedOffsets(), "only the in-flight record settled")
+}
+
+// On shutdown the claim's wait and the dispatcher's drain share one deadline: a hung call is
+// given one drain window in total, not one per stage.
+func TestRunSubscription_ShutdownWaitsOneDrainWindowInTotal(t *testing.T) {
+	g := useFakeGroup(t)
+	host, started, release := blockingUpstream(t)
+	t.Cleanup(func() { close(release) })
+	stop := runSubscriptionInBackground(t, &schemas.ConsumerConfig{Topics: []string{"in"}, Group: "g", Service: host, DrainWindow: 400 * time.Millisecond})
+	g.QueueMessage(&sarama.ConsumerMessage{Topic: "in", Offset: 1, Value: []byte(`{}`)})
+	waitStarted(t, started)
+
+	began := time.Now()
+	stop()
+	elapsed := time.Since(began)
+
+	assert.GreaterOrEqual(t, elapsed, 400*time.Millisecond, "the in-flight call gets the drain window")
+	assert.Less(t, elapsed, 700*time.Millisecond, "one drain window in total, not two")
+	assert.Empty(t, g.MarkedOffsets())
+}
+
+// Records held behind an unsettled one count as uncommitted until they are marked or their claim
+// ends; then the pipeline's count returns to zero.
+func TestConsumeClaim_ReportsUncommittedRecords(t *testing.T) {
+	f := newClaimFixture(t, 64)
+	state := transport.NewPipelineState()
+	f.consumer.state = state
+	done := f.run()
+
+	for i := range 41 {
+		f.claim.msgs <- &sarama.ConsumerMessage{Topic: "in", Offset: int64(i), Value: []byte(`{}`)}
+	}
+	events := make([]*schemas.ConsumerEvent, 0, 41)
+	for range 41 {
+		events = append(events, <-f.ch)
+	}
+	for _, ev := range events[1:] {
+		ev.Ack()
+	}
+
+	assert.Equal(t, int64(41), state.Snapshot().Uncommitted, "40 settled records wait behind the first one")
+	assert.Empty(t, f.session.Marked())
+
+	f.cancel()
+	require.NoError(t, waitDone(t, done))
+	assert.Zero(t, state.Snapshot().Uncommitted, "an ended claim no longer counts its records")
+
+	events[0].Ack()
+	assert.Zero(t, state.Snapshot().Uncommitted, "a late ack does not count twice")
+}
+
+func TestOffsetTracker_UncommittedFollowsMarks(t *testing.T) {
+	state := transport.NewPipelineState()
+	tr := &offsetTracker{session: &ctxSession{ctx: context.Background()}, state: state}
+
+	ack1, _ := tr.track(&sarama.ConsumerMessage{Offset: 1})
+	ack2, _ := tr.track(&sarama.ConsumerMessage{Offset: 2})
+	assert.Equal(t, int64(2), state.Snapshot().Uncommitted)
+
+	ack2()
+	assert.Equal(t, int64(2), state.Snapshot().Uncommitted, "offset 2 waits for offset 1")
+	ack1()
+	assert.Zero(t, state.Snapshot().Uncommitted)
+}
+
+// A claim that starts while the process is paused pauses its partition and hands out nothing
+// until resume; then the held record and the next one are handed out in order.
+func TestConsumeClaim_PausedClaimHoldsRecordsUntilResume(t *testing.T) {
+	f := newClaimFixture(t, 4)
+	g := mocksarama.NewFakeConsumerGroup(nil)
+	pause := NewPause()
+	pause.Toggle()
+	f.consumer.pause, f.consumer.group = pause, g
+	done := f.run()
+
+	f.claim.msgs <- &sarama.ConsumerMessage{Topic: "in", Offset: 1, Value: []byte(`{}`)}
+	f.claim.msgs <- &sarama.ConsumerMessage{Topic: "in", Offset: 2, Value: []byte(`{}`)}
+	require.Eventually(t, func() bool { return g.PauseCount() == 1 }, time.Second, 5*time.Millisecond,
+		"the partition is paused at claim start")
+	select {
+	case <-f.ch:
+		t.Fatal("no record may be handed out while paused")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	pause.Toggle()
+	first, second := <-f.ch, <-f.ch
+	assert.Equal(t, "in", first.Values.Topic)
+	first.Ack()
+	second.Ack()
+	assert.Equal(t, []int64{1, 2}, f.session.Marked(), "records are handed out in order after resume")
+
+	f.cancel()
+	require.NoError(t, waitDone(t, done))
+}
+
+// A session that ends while a record waits for resume returns without tracking it, so it is
+// redelivered and nothing waits for its settlement.
+func TestConsumeClaim_SessionEndDuringPauseLeavesTheRecordUntracked(t *testing.T) {
+	f := newClaimFixture(t, 4)
+	state := transport.NewPipelineState()
+	pause := NewPause()
+	pause.Toggle()
+	f.consumer.pause, f.consumer.state = pause, state
+	done := f.run()
+
+	f.claim.msgs <- &sarama.ConsumerMessage{Topic: "in", Offset: 1, Value: []byte(`{}`)}
+	time.Sleep(50 * time.Millisecond)
+	f.cancel()
+
+	require.NoError(t, waitDone(t, done))
+	assert.Empty(t, f.ch, "the record was not handed out")
+	assert.Empty(t, f.session.Marked())
+	assert.Zero(t, state.Snapshot().Uncommitted, "the record was never tracked")
 }

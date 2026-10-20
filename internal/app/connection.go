@@ -48,8 +48,9 @@ var retryWindow = 5 * time.Minute
 // HTTP starts first and never waits for Kafka, which connects in the background with retries;
 // Consumers start only after the producer settles, so no response goes into an empty registry.
 // A consumer that permanently cannot consume (client creation or subscription start fails) is fatal.
-// A producer that fails permanently while any active stanza has a response_topic is fatal:
-// no consumer reads a record and the process exits non-zero, so the supervisor restarts it.
+// A producer that fails permanently is fatal whenever producers are configured: no consumer reads a
+// record and the process exits non-zero, so the supervisor restarts it instead of leaving it never
+// ready. SIGUSR1 toggles the process-wide pause that every subscription follows.
 // Shutdown stops intake, flushes queued responses, then closes the producer and sinks, all
 // bounded by timeouts.shutdown.
 func Connect(ctx context.Context, cfg *config.Config) error {
@@ -57,20 +58,24 @@ func Connect(ctx context.Context, cfg *config.Config) error {
 	defer cancel()
 	kafkaConfig := cfg.Kafka
 
-	if err := config.Validate(kafkaConfig); err != nil {
-		return fmt.Errorf("configurations are not installed correctly: %w", err)
+	warnings, consumerTuning, producerTuning, err := check(kafkaConfig)
+	for _, w := range warnings {
+		log.Warn().Msg(w)
 	}
-
-	if err := config.PrepareUpstreams(kafkaConfig); err != nil {
-		return fmt.Errorf("invalid upstream configuration: %w", err)
-	}
-
-	consumerTuning, producerTuning, err := loadTuning(kafkaConfig)
 	if err != nil {
 		return err
 	}
 
-	logTransaction, err := observability.NewFileTransactionLogger(cfg.MetricFilePath(), cfg.AuditGRPCEndpoint)
+	consumers := activeConsumers(kafkaConfig)
+	for i, c := range kafkaConfig.Consumers {
+		if c == nil || len(c.Topics) == 0 {
+			log.Info().Msgf("consumer #%d has no topics: disabled", i+1)
+		}
+	}
+
+	logRetention(cfg.Retention)
+	logTransaction, err := observability.NewFileTransactionLogger(cfg.MetricFilePath(), cfg.AuditGRPCEndpoint,
+		observability.WithRetention(cfg.Retention.MaxBackups, cfg.Retention.MaxAgeDays))
 	if err != nil {
 		return fmt.Errorf("error create NewFileTransactionLogger: %w", err)
 	}
@@ -82,17 +87,7 @@ func Connect(ctx context.Context, cfg *config.Config) error {
 
 	// errCh holds one report per reporter: every consumer, the HTTP server and
 	// the producer, so no reporter ever blocks on a full channel.
-	errCh := make(chan error, len(kafkaConfig.Consumers)+2)
-
-	// needsResponses: at least one active stanza must publish a response, so a
-	// missing producer would consume records and silently discard their responses.
-	needsResponses := false
-	for _, c := range kafkaConfig.Consumers {
-		if c != nil && len(c.Topics) > 0 && c.ResponseTopic != "" {
-			needsResponses = true
-			break
-		}
-	}
+	errCh := make(chan error, len(consumers)+2)
 
 	ready := newReadiness(registry, kafkaConfig)
 	srv := newHTTPServer(logTransaction, registry, kafkaConfig, ready, cfg.HTTPAddr)
@@ -115,9 +110,7 @@ func Connect(ctx context.Context, cfg *config.Config) error {
 		defer close(producersSettled)
 		if err := startProducer(ctx, kafkaConfig, producerTuning, registry); err != nil && ctx.Err() == nil {
 			producerFailed.Store(true)
-			if needsResponses {
-				errCh <- fmt.Errorf("permanently failed to create producer: %w", err)
-			}
+			errCh <- fmt.Errorf("permanently failed to create producer: %w", err)
 		}
 	}()
 
@@ -125,25 +118,23 @@ func Connect(ctx context.Context, cfg *config.Config) error {
 	// response topic that fails holds back only its own pipeline.
 	publishCtx, stopPublish := context.WithCancel(context.Background())
 	var publishers sync.WaitGroup
-	queues := make([]chan *schemas.ConsumerEvent, len(kafkaConfig.Consumers))
-	for i, c := range kafkaConfig.Consumers {
-		if c == nil || c.ResponseTopic == "" {
+	queues := make([]chan *schemas.ConsumerEvent, len(consumers))
+	for i, c := range consumers {
+		if c.ResponseTopic == "" {
 			continue
 		}
 		queues[i] = transport.NewResponseQueue()
 		publishers.Add(1)
-		go func(queue <-chan *schemas.ConsumerEvent, workers int) {
+		go func(queue <-chan *schemas.ConsumerEvent, workers int, state *transport.PipelineState) {
 			defer publishers.Done()
-			responsePublish(publishCtx, queue, workers, logTransaction, registry)
-		}(queues[i], transport.PublisherCount(c))
+			responsePublish(publishCtx, queue, workers, logTransaction, registry, state)
+		}(queues[i], transport.PublisherCount(c), ready.pipelines[i].state)
 	}
 
-	toggles := make([]chan struct{}, len(kafkaConfig.Consumers))
 	var wg sync.WaitGroup
-	for i, consumerConfig := range kafkaConfig.Consumers {
-		toggles[i] = make(chan struct{}, 1)
+	for i, consumerConfig := range consumers {
 		wg.Add(1)
-		go func(conf *schemas.ConsumerConfig, toggle <-chan struct{}, queue chan<- *schemas.ConsumerEvent) {
+		go func(conf *schemas.ConsumerConfig, queue chan<- *schemas.ConsumerEvent, state *transport.PipelineState) {
 			defer wg.Done()
 
 			consumerClient, err := newConsumerClientWithRetry(ctx, kafkaConfig, conf, consumerTuning)
@@ -165,17 +156,17 @@ func Connect(ctx context.Context, cfg *config.Config) error {
 				return
 			}
 
-			if producerFailed.Load() && conf.ResponseTopic != "" {
-				log.Warn().Msgf("producer failed: consumer for topics %v will not read, its responses could not be published", conf.Topics)
+			if producerFailed.Load() {
+				log.Warn().Msgf("producer failed: consumer for topics %v will not read, the process is stopping", conf.Topics)
 				return
 			}
 
 			log.Info().Msgf("consumer client initialized for topics: %v", conf.Topics)
 			ready.consumerUp()
-			if err := runSubscription(ctx, toggle, consumerClient, conf, queue, logTransaction); err != nil && ctx.Err() == nil {
+			if err := runSubscription(ctx, ready.pause, consumerClient, conf, queue, logTransaction, state); err != nil && ctx.Err() == nil {
 				errCh <- err
 			}
-		}(consumerConfig, toggles[i], queues[i])
+		}(consumerConfig, queues[i], ready.pipelines[i].state)
 	}
 
 	usr1 := make(chan os.Signal, 1)
@@ -193,12 +184,7 @@ loop:
 			log.Error().Err(runErr).Msg("terminating: unrecoverable error")
 			break loop
 		case <-usr1:
-			for _, t := range toggles {
-				select {
-				case t <- struct{}{}:
-				default:
-				}
-			}
+			ready.pause.Toggle()
 		}
 	}
 
@@ -242,24 +228,83 @@ func startProducer(ctx context.Context, kafkaConfig *schemas.KafkaInfo, tuning *
 	return nil
 }
 
-// loadTuning loads the Kafka client tuning files once, before anything starts, and only those
-// whose client is needed: the consumer file with an active stanza, the producer file with a
-// producer. A missing or broken file can never heal, so it stops startup instead of being retried.
-func loadTuning(kafkaConfig *schemas.KafkaInfo) (consumer, producer *router.Tuning, err error) {
+// activeConsumers returns the consumer stanzas that have topics. A stanza without topics is
+// disabled: it gets no Kafka client, no subscription and no place in readiness.
+func activeConsumers(kafkaConfig *schemas.KafkaInfo) []*schemas.ConsumerConfig {
+	var active []*schemas.ConsumerConfig
 	for _, c := range kafkaConfig.Consumers {
 		if c != nil && len(c.Topics) > 0 {
-			if consumer, err = router.LoadConsumerTuning(); err != nil {
-				return nil, nil, fmt.Errorf("invalid Kafka consumer tuning: %w", err)
-			}
-			break
+			active = append(active, c)
+		}
+	}
+	return active
+}
+
+// Check runs every configuration check startup runs, without connecting anywhere or opening log
+// files: the Kafka setup, the upstream settings, the consumer topology and the Kafka tuning files.
+// It returns the warnings and one error joining every problem found.
+func Check(cfg *config.Config) (warnings []string, err error) {
+	warnings, _, _, err = check(cfg.Kafka)
+	return warnings, err
+}
+
+// check is Check that also returns the loaded tuning, for Connect. Every part runs even when an
+// earlier one failed, and each keeps its own error prefix.
+func check(kafkaConfig *schemas.KafkaInfo) (warnings []string, consumer, producer *router.Tuning, err error) {
+	var errs []error
+	if err := config.Validate(kafkaConfig); err != nil {
+		errs = append(errs, fmt.Errorf("configurations are not installed correctly: %w", err))
+	}
+	if err := config.PrepareUpstreams(kafkaConfig); err != nil {
+		errs = append(errs, fmt.Errorf("invalid upstream configuration: %w", err))
+	}
+	warnings, err = config.Topology(kafkaConfig)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("invalid consumer topology: %w", err))
+	}
+	consumer, producer, err = loadTuning(kafkaConfig)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	return warnings, consumer, producer, errors.Join(errs...)
+}
+
+// loadTuning loads the Kafka client tuning files once, before anything starts, and only those
+// whose client is needed: the consumer file with an active stanza, the producer file with a
+// producer. A missing or broken file can never heal, so it stops startup instead of being retried;
+// both files are checked even when the first is broken.
+func loadTuning(kafkaConfig *schemas.KafkaInfo) (consumer, producer *router.Tuning, err error) {
+	var errs []error
+	if len(activeConsumers(kafkaConfig)) > 0 {
+		if consumer, err = router.LoadConsumerTuning(); err != nil {
+			errs = append(errs, fmt.Errorf("invalid Kafka consumer tuning: %w", err))
 		}
 	}
 	if len(kafkaConfig.Producers) > 0 {
 		if producer, err = router.LoadProducerTuning(); err != nil {
-			return nil, nil, fmt.Errorf("invalid Kafka producer tuning: %w", err)
+			errs = append(errs, fmt.Errorf("invalid Kafka producer tuning: %w", err))
 		}
 	}
+	if len(errs) > 0 {
+		return nil, nil, errors.Join(errs...)
+	}
 	return consumer, producer, nil
+}
+
+// logRetention states the backup retention once at startup when a limit is set, since it means
+// older audit entries are deleted; with no limit it logs nothing.
+func logRetention(r config.Retention) {
+	if r.MaxBackups == 0 && r.MaxAgeDays == 0 {
+		return
+	}
+	count, age := "no count limit", "no age limit"
+	if r.MaxBackups > 0 {
+		count = fmt.Sprintf("at most %d backups", r.MaxBackups)
+	}
+	if r.MaxAgeDays > 0 {
+		age = fmt.Sprintf("backups younger than %d days", r.MaxAgeDays)
+	}
+	log.Info().Msgf("metric and audit backups are pruned: keeping %s and %s of each file; older audit backups are deleted", count, age)
 }
 
 // closeProducer closes the shared producer exactly once, however many topics map to it.
@@ -343,6 +388,18 @@ func registerRoutes(mux *http.ServeMux, logTransaction schemas.TransactionLogger
 	log.Info().Msg("publish endpoint registered")
 }
 
+// Public listener timeouts. A whole request (headers and the body of up to 2 MB) must arrive
+// within httpReadTimeout, and an idle keep-alive connection is closed after httpIdleTimeout, above
+// common load-balancer idle timeouts. There is deliberately no write timeout: a publish may wait
+// for Kafka retries, and cutting the connection after the record may have been written would leave
+// the client unsure whether to retry. httpReadTimeout is a variable so tests can shorten it.
+const (
+	httpReadHeaderTimeout = 10 * time.Second
+	httpIdleTimeout       = 120 * time.Second
+)
+
+var httpReadTimeout = 30 * time.Second
+
 // newHTTPServer serves the publish API and probes (/health is the legacy alias of /healthz) on
 // its own mux, which keeps the pprof handlers off the public listener.
 func newHTTPServer(logTransaction schemas.TransactionLogger, registry *router.ProducerRegistry, kafkaConfig *schemas.KafkaInfo, ready *readiness, addr string) *http.Server {
@@ -356,7 +413,9 @@ func newHTTPServer(logTransaction schemas.TransactionLogger, registry *router.Pr
 	return &http.Server{
 		Addr:              addr,
 		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		IdleTimeout:       httpIdleTimeout,
 	}
 }
 

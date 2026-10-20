@@ -1,8 +1,8 @@
 package schemas
 
 import (
+	"io"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/IBM/sarama"
@@ -26,7 +26,8 @@ type TransactionLogger interface {
 }
 
 type FileTransactionLogger struct {
-	File   *os.File
+	// Sink receives the metric lines (a rotating file in production).
+	Sink   io.WriteCloser
 	Events chan Event
 }
 

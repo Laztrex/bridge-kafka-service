@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	accesslog "github.com/envoyproxy/go-control-plane/envoy/service/accesslog/v3"
 	"google.golang.org/grpc"
@@ -23,6 +24,8 @@ type Server struct {
 	mu       sync.Mutex
 	messages []*accesslog.StreamAccessLogsMessage
 	failWith error
+	delay    time.Duration
+	streams  int
 	grpc     *grpc.Server
 }
 
@@ -47,6 +50,20 @@ func (s *Server) FailWith(err error) {
 	s.failWith = err
 }
 
+// Delay makes every following stream wait d (or until the client gives up) before answering.
+func (s *Server) Delay(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.delay = d
+}
+
+// Streams returns how many streams the server has accepted.
+func (s *Server) Streams() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.streams
+}
+
 // Messages returns a snapshot of the received messages.
 func (s *Server) Messages() []*accesslog.StreamAccessLogsMessage {
 	s.mu.Lock()
@@ -56,9 +73,20 @@ func (s *Server) Messages() []*accesslog.StreamAccessLogsMessage {
 
 // StreamAccessLogs implements accesslog.AccessLogServiceServer.
 func (s *Server) StreamAccessLogs(stream accesslog.AccessLogService_StreamAccessLogsServer) error {
+	s.mu.Lock()
+	s.streams++
+	s.mu.Unlock()
 	for {
 		msg, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
+			s.mu.Lock()
+			delay := s.delay
+			s.mu.Unlock()
+			select {
+			case <-time.After(delay):
+			case <-stream.Context().Done():
+				return stream.Context().Err()
+			}
 			return stream.SendAndClose(&accesslog.StreamAccessLogsResponse{})
 		}
 		if err != nil {

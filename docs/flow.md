@@ -30,12 +30,15 @@ sequenceDiagram
     Note over K,UP: Record processing
     K-->>B: record from a consumer topic
     B->>B: body → JSON, tracking headers
+    B->>B: header policy: required header missing / not carriable → failure, no call<br/>other headers the transport cannot carry → left out, warning
     B->>UP: POST /path or Predict(details, data)<br/>with service.timeout
     alt upstream responded (including HTTP 4xx/5xx and gRPC errors)
         UP-->>B: response
         opt response_topic set
             B->>K: write the response to response_topic
         end
+    else depends only on the record (response > 16 MiB), any on_failure
+        UP--xB: error → failure, settled after one attempt
     else unavailable / timeout, on_failure: skip (default)
         UP--xB: error → failure
     else unavailable / timeout, on_failure: retry
@@ -55,8 +58,11 @@ At every step the service writes `controller_kafka_*` metrics to a file and audi
 
 - **The offset is committed after processing.** A record counts as processed when
   the response is written to Kafka or the upstream call has finally failed. Offsets
-  are committed strictly in read order. If a call is aborted on shutdown,
-  the record is redelivered.
+  are committed strictly in read order. When the consumer group session ends (shutdown
+  or rebalance), the claim waits up to `timeouts.shutdown` for its in-flight records,
+  so the ones that finish are committed before the partition is released; records of
+  the ended session that were not sent to the service yet are not sent at all. Only
+  calls still running after the wait are redelivered.
 - **Response publication follows `on_failure` too.** Under `skip` a failed write to
   `response_topic` is recorded as a failure and the offset is settled. Under
   `retry` the write is repeated with the shared backoff (1s doubling up to 30s)
@@ -73,7 +79,15 @@ At every step the service writes `controller_kafka_*` metrics to a file and audi
   commits the offset. `retry` holds the offset and repeats the call with backoff until
   the upstream recovers, so an outage loses nothing. A record that keeps failing while
   other calls succeed is treated as poison and skipped after 5 attempts. Requires
-  `service.max_conn`.
+  `service.max_conn`. A failure that depends only on the record (a response over
+  16 MiB, a required header that is missing or that the transport cannot carry) is
+  settled after one attempt under both policies, so it never stalls a pipeline, even
+  one with `max_conn: 1`. Retries are visible per pipeline in `GET /status`.
+- **Headers are checked before the call.** Transport-controlled headers (hop-by-hop,
+  `Host`, `Content-Length`, `Content-Type`) never go into an HTTP call, which always
+  carries `Content-Type: application/json`. Other headers the transport cannot carry
+  are left out of the call with a warning; the record keeps them for audit and the
+  response record.
 - **The HTTP API returns 200 even if the Kafka write failed.** The outcome is
   in the `result` field.
 - **One producer for all topics.** Only topics from the `producer` config can be
@@ -83,6 +97,7 @@ At every step the service writes `controller_kafka_*` metrics to a file and audi
   calls per pipeline (reading pauses until a call finishes). Each HTTP upstream
   keeps its own connection pool sized to the pipeline's limit, so calls reuse
   connections instead of reconnecting.
-- **Signals:** `SIGUSR1` pauses or resumes consumption.
+- **Signals:** `SIGUSR1` pauses or resumes consumption of the whole process: partitions
+  received while paused stay paused, and already delivered records are held until resume.
   `SIGINT`/`SIGTERM` stop the service: intake stops, upstream calls get
   up to `timeouts.shutdown` (default 10s) to finish, and accumulated responses are published.

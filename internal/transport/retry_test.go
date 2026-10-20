@@ -213,7 +213,7 @@ func TestRetry_SlotsRetryingStopFurtherCalls(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		transport.ConsumerResponseSlow(logger(t), conf, up, ch, nil, context.Background())
+		transport.ConsumerResponseSlow(logger(t), conf, up, ch, nil, context.Background(), nil)
 	}()
 
 	time.Sleep(100 * time.Millisecond)

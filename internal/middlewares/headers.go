@@ -1,7 +1,6 @@
 package middlewares
 
 import (
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -11,73 +10,67 @@ import (
 	"bridge-kafka-service/internal/schemas"
 )
 
-// HeaderRule defines how a header is processed.
+// HeaderRule defines the default of a tracking header that is absent.
 type HeaderRule struct {
 	Key          string
-	Required     bool
 	DefaultValue func(existingHeaders map[string]string) string
 }
 
 // headerRules defines the rules for system headers.
 var headerRules = []HeaderRule{
 	{
-		Key:      consts.HeaderRequestIdKey,
-		Required: false,
+		Key: consts.HeaderRequestIdKey,
 		DefaultValue: func(_ map[string]string) string {
 			return codec.NewRequestID()
 		},
 	},
 	{
-		Key:      consts.HeaderRequestTimeKey,
-		Required: false,
+		Key: consts.HeaderRequestTimeKey,
 		DefaultValue: func(_ map[string]string) string {
 			return time.Now().UTC().Format("2006-01-02 15:04:05Z")
 		},
 	},
 	{
-		Key:      consts.HeaderTraceIdKey,
-		Required: false,
+		Key: consts.HeaderTraceIdKey,
 		DefaultValue: func(headers map[string]string) string {
 			return headers[consts.HeaderRequestIdKey]
 		},
 	},
 }
 
-// ProcessHeaders processes headers according to the rules.
-func ProcessHeaders(header http.Header) (map[string]string, error) {
+// ProcessHeaders applies the tracking-header rules: a header that is absent gets its default. Which
+// headers must be present is consts.RequiredHeaders, checked by the entry points.
+func ProcessHeaders(header http.Header) map[string]string {
 	result := make(map[string]string)
 
 	for _, rule := range headerRules {
 		value := header.Get(rule.Key)
-
-		if value == "" {
-			if rule.Required {
-				return nil, fmt.Errorf("missing required header: %s", rule.Key)
-			}
-			if rule.DefaultValue != nil {
-				value = rule.DefaultValue(result)
-			}
+		if value == "" && rule.DefaultValue != nil {
+			value = rule.DefaultValue(result)
 		}
 		result[rule.Key] = value
 	}
 
-	return result, nil
+	return result
 }
 
 // HeaderHttpHandler processes HTTP headers and sets them as Kafka headers.
-func HeaderHttpHandler(header http.Header, body *schemas.RequestBody) error {
-	headers, err := ProcessHeaders(header)
-	if err != nil {
-		return err
-	}
-
-	for key, value := range headers {
+func HeaderHttpHandler(header http.Header, body *schemas.RequestBody) {
+	for key, value := range ProcessHeaders(header) {
 		body.Headers[key] = value
 	}
 
 	liftCustomHeaders(header, body.Headers)
+}
 
-	return nil
+// missingRequiredHeader returns the first header of consts.RequiredHeaders that header lacks, or "".
+func missingRequiredHeader(header http.Header) string {
+	for _, name := range consts.RequiredHeaders {
+		if header.Get(name) == "" {
+			return name
+		}
+	}
+	return ""
 }
 
 // liftCustomHeaders copies headers carrying the application's custom prefix into
@@ -103,20 +96,23 @@ func setHttpHeaders(w http.ResponseWriter, headers map[string]string) {
 }
 
 // setKafkaHeaders fills body.Headers with Kafka headers from the processed headers, including the
-// optional partition key (x-kafka-key).
+// optional partition key (x-kafka-key) and every required header under its lowercase wire name.
 func setKafkaHeaders(
 	requestHeaders http.Header,
 	body *schemas.RequestBody,
 ) {
-	processedHeaders, err := ProcessHeaders(requestHeaders)
-	if err == nil {
-		for key, value := range processedHeaders {
-			body.Headers[key] = value
-		}
+	for key, value := range ProcessHeaders(requestHeaders) {
+		body.Headers[key] = value
 	}
 
 	if key := requestHeaders.Get(consts.HeaderKafkaKey); key != "" {
 		body.Headers[consts.HeaderKafkaKey] = key
+	}
+
+	for _, name := range consts.RequiredHeaders {
+		if value := requestHeaders.Get(name); value != "" {
+			body.Headers[strings.ToLower(name)] = value
+		}
 	}
 
 	liftCustomHeaders(requestHeaders, body.Headers)

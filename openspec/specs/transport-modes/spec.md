@@ -36,12 +36,12 @@ In slow mode the system MUST permit at most `max_conn` simultaneous upstream req
 
 ### Requirement: Response decoupling from request path
 
-The system MUST funnel every successful upstream response of a pipeline into that pipeline's own response-publication queue so that publishing failures, slow brokers, or pause/resume toggles never stall consumption. A pipeline's responses MUST NOT wait behind the responses of another pipeline: a response topic that is slow or rejects writes MUST hold back only the pipeline that publishes to it. Each pipeline MUST publish up to `min(L, 16)` responses concurrently, where `L` is the pipeline's upstream concurrency limit (`max_conn`, or the fast-mode ceiling); a pipeline with `max_conn: 1` therefore publishes one response at a time, in the order its upstream calls complete. The exception to non-blocking hand-off is a stanza with `on_failure: retry`: there a saturated queue MUST hold the upstream call until space frees, so the response is never dropped and backpressure stops consumption instead.
+The system MUST funnel every successful upstream response of a pipeline into that pipeline's own response-publication queue so that publishing failures, slow brokers, or pause/resume toggles never stall consumption. A pipeline's responses MUST NOT wait behind the responses of another pipeline: a response topic that is slow or rejects writes MUST hold back only the pipeline that publishes to it. Each pipeline MUST publish up to `min(L, 16)` responses concurrently, where `L` is the pipeline's upstream concurrency limit (`max_conn`, or the fast-mode ceiling); a pipeline with `max_conn: 1` therefore publishes one response at a time, in the order its upstream calls complete. The exception to non-blocking hand-off is a stanza with `on_failure: retry`: there a saturated queue MUST hold the upstream call until space frees, so the response is never dropped and backpressure stops consumption instead. A response dropped from a saturated queue MUST be recorded as a failed `response_service` event, in metrics and audit, exactly once.
 
 #### Scenario: Publication channel saturated
 
 - **WHEN** the pipeline's response queue is full because publishing is slow and the stanza's failure policy is `skip`
-- **THEN** newly produced responses are dropped with a warning logged rather than blocking consumption, and the originating message is still settled
+- **THEN** newly produced responses are dropped with a warning logged rather than blocking consumption, each dropped response is counted once in `controller_kafka_response_service_failure_total` with its request id, and the originating message is still settled
 
 #### Scenario: Publication channel saturated in retry mode
 

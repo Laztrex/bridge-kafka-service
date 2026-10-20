@@ -13,6 +13,7 @@ import (
 
 	"bridge-kafka-service/internal/consts"
 	"bridge-kafka-service/internal/schemas"
+	"bridge-kafka-service/testutil/requiredheaders"
 )
 
 func consume(t *testing.T, value []byte, headers ...*sarama.RecordHeader) *schemas.RequestBody {
@@ -56,6 +57,53 @@ func TestGetConsumeMsg_HeadersAreEnrichedAndBinarySafe(t *testing.T) {
 func TestGetConsumeMsg_GeneratesRequestIdWhenAbsent(t *testing.T) {
 	body := consume(t, []byte(`{}`))
 	assert.Len(t, body.Headers[consts.HeaderRequestIdKey], 36)
+}
+
+func TestGetConsumeMsg_TrackingHeadersIgnoreCase(t *testing.T) {
+	body := &schemas.RequestBody{}
+
+	requestId := GetConsumeMsg(&sarama.ConsumerMessage{Value: []byte(`{}`), Headers: []*sarama.RecordHeader{
+		{Key: []byte("X-Request-Id"), Value: []byte("abc")},
+		{Key: []byte("X-Client-Id"), Value: []byte("billing")},
+		{Key: []byte("X-Trace-Id"), Value: []byte("t-1")},
+	}}, body)
+
+	assert.Equal(t, "abc", requestId, "the record's id is reused, not regenerated")
+	assert.Equal(t, map[string]string{
+		consts.HeaderRequestIdKey: "abc", consts.HeaderClientId: "billing", consts.HeaderTraceIdKey: "t-1",
+	}, body.Headers, "stored under the lowercase wire names, with no default added beside them")
+}
+
+func TestGetConsumeMsg_LowercaseSpellingWins(t *testing.T) {
+	body := consume(t, []byte(`{}`),
+		&sarama.RecordHeader{Key: []byte("X-Request-Id"), Value: []byte("upper")},
+		&sarama.RecordHeader{Key: []byte(consts.HeaderRequestIdKey), Value: []byte("lower")},
+	)
+
+	assert.Equal(t, "lower", body.Headers[consts.HeaderRequestIdKey])
+	assert.NotContains(t, body.Headers, "X-Request-Id")
+}
+
+func TestGetConsumeMsg_RequiredHeadersGetNoDefault(t *testing.T) {
+	requiredheaders.Set(t, consts.HeaderRequestIdKey, consts.HeaderClientId)
+	body := &schemas.RequestBody{}
+
+	requestId := GetConsumeMsg(&sarama.ConsumerMessage{Value: []byte(`{}`)}, body)
+
+	assert.NotContains(t, body.Headers, consts.HeaderRequestIdKey, "a listed header stays absent")
+	assert.NotContains(t, body.Headers, consts.HeaderClientId)
+	assert.Len(t, requestId, 36, "logs and audit still get a request id")
+}
+
+func TestPrepareConsumeMsg_RequiredRequestIdAbsentStillNamesTheEvent(t *testing.T) {
+	requiredheaders.Set(t, consts.HeaderRequestIdKey)
+	ev := &schemas.Event{EventType: consts.EventConsume}
+
+	out := PrepareConsumeMsg(&sarama.ConsumerMessage{Value: []byte(`{}`)}, ev, &schemas.RequestBody{})
+
+	assert.Len(t, ev.RequestId, 36)
+	assert.Equal(t, ev.RequestId, out.Values.RequestId)
+	assert.NotContains(t, out.Values.Body.Headers, consts.HeaderRequestIdKey)
 }
 
 func TestPrepareConsumeMsg_SetsEventAndContext(t *testing.T) {

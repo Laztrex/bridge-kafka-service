@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -49,6 +50,13 @@ type KafkaTLS struct {
 	SkipVerify bool   `yaml:"kafka.tls.skip.insecure.verify"`
 }
 
+// Retention holds the retention.* keys: how many backups of the metric and audit files are kept and
+// for how many days. 0 means no limit, which keeps every backup.
+type Retention struct {
+	MaxBackups int `yaml:"retention.max_backups"`
+	MaxAgeDays int `yaml:"retention.max_age_days"`
+}
+
 // Config is the loaded application configuration.
 type Config struct {
 	LogLevel          string        `yaml:"logLevel"`
@@ -57,6 +65,7 @@ type Config struct {
 	AuditGRPCEndpoint string        `yaml:"audit.grpc_endpoint"` // empty disables the gRPC audit sink
 	ShutdownTimeout   time.Duration `yaml:"timeouts.shutdown"`
 	KafkaTLS          KafkaTLS      `yaml:"-"`
+	Retention         Retention     `yaml:"-"`
 
 	// Kafka holds kafka.brokers, kafka.version and the consumer and producer sections;
 	// TLSConf is built from KafkaTLS by Load.
@@ -143,6 +152,13 @@ func Load(path string, getenv func(string) string) (*Config, error) {
 		cfg.ShutdownTimeout = d
 	}
 
+	if cfg.Retention.MaxBackups, err = wholeNumber(src, "retention.max_backups"); err != nil {
+		return nil, err
+	}
+	if cfg.Retention.MaxAgeDays, err = wholeNumber(src, "retention.max_age_days"); err != nil {
+		return nil, err
+	}
+
 	var unused []string
 	collect := func(u []string, err error) error {
 		unused = append(unused, u...)
@@ -200,7 +216,7 @@ func servicePort(src *source, host string) string {
 // knownTopLevel are the keys the loader reads at the top level (lower case).
 var knownTopLevel = map[string]bool{
 	"loglevel": true, "http": true, "pprof": true, "audit": true, "kafka": true,
-	"consumer": true, "producer": true, "timeouts": true,
+	"consumer": true, "producer": true, "timeouts": true, "retention": true,
 	"log_path": true, "log_file_name": true, "metric_path": true, "metric_file_name": true,
 	"system_id": true, "config_path": true,
 }
@@ -223,6 +239,19 @@ func unknownKeys(src *source, unused []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// wholeNumber reads key as a retention limit: unset is 0, otherwise a whole number >= 0.
+func wholeNumber(src *source, key string) (int, error) {
+	v := src.String(key)
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("%s: expected a whole number >= 0, got %q", key, v)
+	}
+	return n, nil
 }
 
 func orDefault(v, def string) string {
@@ -259,39 +288,57 @@ func dotenvValue(path, key string) string {
 	return ""
 }
 
-// Validate checks that the Kafka setup can work: brokers are set, every active consumer has a
-// group and a service, and there is at least one active consumer or producer. With active
-// consumers, a kafka.version below 0.10.2 is rejected because consumer groups need it; an
-// unparseable version is left to the client's fallback, which supports groups.
+// Validate checks that the Kafka setup can work: brokers are set, every consumer and producer entry is set,
+// every active consumer has a group and a service, and there is at least one active consumer or
+// producer. A non-empty kafka.version must parse; an empty one means the client default (2.7.0).
+// With active consumers a version below 0.10.2 is rejected because consumer groups need it; with
+// producers, one below 0.11, because every published record carries headers. Every problem is
+// reported, joined into one error.
 func Validate(k *schemas.KafkaInfo) error {
+	var errs []error
 	if len(k.Brokers) == 0 {
-		return errors.New("no Kafka bootstrap brokers defined")
+		errs = append(errs, errors.New("no Kafka bootstrap brokers defined"))
 	}
 	hasActiveConsumers := false
 	for i, consumer := range k.Consumers {
+		if consumer == nil {
+			errs = append(errs, fmt.Errorf("consumer #%d is empty", i+1))
+			continue
+		}
 		if len(consumer.Topics) == 0 {
 			continue
 		}
 		hasActiveConsumers = true
 		if consumer.Group == "" {
-			return fmt.Errorf("no Kafka consumer group defined for consumer #%d", i+1)
+			errs = append(errs, fmt.Errorf("no Kafka consumer group defined for consumer #%d", i+1))
 		}
 		if consumer.Service.Name == "" {
-			return fmt.Errorf("no service host defined for consumer #%d", i+1)
+			errs = append(errs, fmt.Errorf("no service host defined for consumer #%d", i+1))
 		}
 	}
-	if hasActiveConsumers {
-		if v, err := sarama.ParseKafkaVersion(k.Version); err == nil && !v.IsAtLeast(sarama.V0_10_2_0) {
-			return fmt.Errorf("kafka.version %q is below 0.10.2, required by consumer groups", k.Version)
+	if k.Version != "" {
+		v, err := sarama.ParseKafkaVersion(k.Version)
+		switch {
+		case err != nil:
+			errs = append(errs, fmt.Errorf("kafka.version %q is not a Kafka version (for example 2.3.0, or 0.11.0.0 for 0.x); leave it empty for the default 2.7.0", k.Version))
+		case hasActiveConsumers && !v.IsAtLeast(sarama.V0_10_2_0):
+			errs = append(errs, fmt.Errorf("kafka.version %q is below 0.10.2, required by consumer groups", k.Version))
+		case len(k.Producers) > 0 && !v.IsAtLeast(sarama.V0_11_0_0):
+			errs = append(errs, fmt.Errorf("kafka.version %q is below 0.11, required for record headers (every published record carries them)", k.Version))
 		}
 	}
-	for _, producer := range k.Producers {
+	hasProducer := false
+	for i, producer := range k.Producers {
+		if producer == nil {
+			errs = append(errs, fmt.Errorf("producer #%d is empty", i+1))
+			continue
+		}
 		if producer.Topic != "" {
-			return nil
+			hasProducer = true
 		}
 	}
-	if !hasActiveConsumers {
-		return errors.New("no active consumers or producers configured")
+	if !hasActiveConsumers && !hasProducer {
+		errs = append(errs, errors.New("no active consumers or producers configured"))
 	}
-	return nil
+	return errors.Join(errs...)
 }

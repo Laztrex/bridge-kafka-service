@@ -59,7 +59,7 @@ Request-scoped work MUST derive its context from the incoming request (`r.Contex
 - **THEN** the context seen by downstream handlers is cancelled
 
 ### Requirement: Pause and resume via SIGUSR1
-The system MUST toggle between active and paused consumption when it receives `SIGUSR1`. A single process-level handler MUST fan the signal out to every running pipeline, so one signal affects all consumers. The first signal pauses every partition of every consumer; the next signal resumes them; subsequent signals keep toggling.
+The system MUST toggle between active and paused consumption when it receives `SIGUSR1`. The pause MUST be one process-wide state that every running pipeline follows, so one signal affects all consumers. The first signal pauses every partition of every consumer; the next signal resumes them; subsequent signals keep toggling. While paused, no claim MUST hand out a record, including records already fetched, and a partition assigned to the process while paused, for example by a rebalance, MUST be paused as soon as its claim starts.
 
 #### Scenario: First SIGUSR1 pauses
 - **WHEN** consumption is active and a single `SIGUSR1` is delivered
@@ -76,6 +76,18 @@ The system MUST toggle between active and paused consumption when it receives `S
 #### Scenario: Alternating toggles
 - **WHEN** three `SIGUSR1` signals arrive in sequence
 - **THEN** the pipeline ends up paused if the count is odd, running if even
+
+#### Scenario: Partition assigned while paused
+- **WHEN** consumption is paused and a rebalance assigns the process a partition it did not own
+- **THEN** that partition hands out no record until the next `SIGUSR1`, and that signal resumes it together with the others
+
+#### Scenario: Records already buffered
+- **WHEN** a claim has fetched records that it has not handed out yet and `SIGUSR1` pauses consumption
+- **THEN** none of those records reaches the upstream until consumption is resumed
+
+#### Scenario: Shutdown while paused
+- **WHEN** the process is paused and receives `SIGTERM`
+- **THEN** it shuts down within the shutdown timeout, as when it is not paused
 
 ### Requirement: Consumer-loop resilience during transient errors
 If the underlying Sarama consumer reports an error that is not "group closed", the system MUST log the error, wait a short back-off interval, and re-enter the consume loop instead of terminating the process.

@@ -106,7 +106,7 @@ If the transaction/metric log file cannot be opened, the service MUST log the er
 - **THEN** startup aborts with an error and no consumers are started
 
 ### Requirement: One producer shared by all producer topics
-When at least one `producer:` entry is configured, the system MUST create exactly one Sarama sync producer and expose it under every configured producer topic; the topic list acts as an allow-list for publishing. On shutdown the producer MUST be closed exactly once. If the producer cannot be created within the retry window while any active consumer stanza has a `response_topic`, the process MUST exit non-zero before any consumer reads a record. Startup ordering and HTTP behaviour while the producer is unavailable are specified by `health-probe` and `control-api`.
+When at least one `producer:` entry is configured, the system MUST create exactly one Sarama sync producer and expose it under every configured producer topic; the topic list acts as an allow-list for publishing. On shutdown the producer MUST be closed exactly once. If the producer cannot be created within the retry window, the process MUST exit non-zero before any consumer reads a record, whether or not an active consumer stanza has a `response_topic`, so the supervisor restarts it instead of leaving it running and never ready. Startup ordering and HTTP behaviour while the producer is unavailable are specified by `health-probe` and `control-api`.
 
 #### Scenario: Three producer topics
 - **WHEN** three producer topics are configured
@@ -114,7 +114,7 @@ When at least one `producer:` entry is configured, the system MUST create exactl
 
 #### Scenario: Producer creation fails permanently
 - **WHEN** the producer cannot be created after the retry window and no active consumer stanza has a `response_topic`
-- **THEN** the error is logged, no topic is registered, and consumption still runs
+- **THEN** the error is logged, no consumer reads a record, and the process exits with a non-zero code so the supervisor restarts it
 
 #### Scenario: Producer creation fails permanently while responses are expected
 - **WHEN** the producer cannot be created after the retry window and at least one active consumer stanza has a `response_topic`
@@ -124,29 +124,9 @@ When at least one `producer:` entry is configured, the system MUST create exactl
 - **WHEN** a consumer client is ready before the producer and a consumer stanza has a `response_topic`
 - **THEN** that consumer does not read records until the producer is connected
 
-### Requirement: Kafka version supports consumer groups
-
-When at least one consumer stanza is active, startup MUST fail if `kafka.version` parses to a Kafka version below 0.10.2, the minimum required by consumer groups; the error MUST name the configured value and the minimum. A value that cannot be parsed MUST keep the existing fallback (2.7.0) and MUST NOT stop startup. A configuration without active consumer stanzas MUST NOT be checked.
-
-#### Scenario: Version too old for consumer groups
-
-- **WHEN** `kafka.version` is `0.10.1.0` and a consumer stanza has topics
-- **THEN** startup fails before the HTTP server starts, with an error naming `0.10.1.0` and the minimum `0.10.2`
-
-#### Scenario: Minimum version accepted
-
-- **WHEN** `kafka.version` is `0.10.2.0` and a consumer stanza has topics
-- **THEN** startup proceeds
-
-#### Scenario: Unparseable version keeps the fallback
-
-- **WHEN** `kafka.version` cannot be parsed
-- **THEN** startup proceeds and consumer clients use version 2.7.0
-
-#### Scenario: Producer-only configuration
-
-- **WHEN** `kafka.version` is `0.10.1.0` and no consumer stanza has topics
-- **THEN** startup proceeds
+#### Scenario: No producer configured
+- **WHEN** no `producer:` entry is configured
+- **THEN** no producer is created, consumption runs, and the publish endpoint answers 503 as specified by `control-api`
 
 ### Requirement: Configurable rebalance strategy
 
@@ -200,6 +180,163 @@ Unless the consumer tuning file overrides them, every consumer MUST use a group 
 - **WHEN** the consumer tuning file sets `consumer.group.session.timeout: 20s`
 - **THEN** consumers use a 20s session timeout and keep the other defaults
 
+### Requirement: Kafka version supports record headers
+
+When at least one producer is configured, startup MUST fail if `kafka.version` parses to a Kafka version below 0.11, the minimum for record headers, which every published record carries; the error MUST name the configured value and the minimum. A non-empty value that cannot be parsed is handled by "Kafka version is valid and supports consumer groups": it stops startup.
+
+#### Scenario: Version too old for headers
+
+- **WHEN** a producer is configured and `kafka.version` is `0.10.2.0`
+- **THEN** startup fails before the HTTP server starts, with an error naming `0.10.2.0` and the minimum `0.11`
+
+#### Scenario: Consumer-only deployment
+
+- **WHEN** no producer is configured and `kafka.version` is `0.10.2.0`
+- **THEN** this check does not stop startup
+
+### Requirement: All configuration errors reported together
+
+After the configuration file is loaded, startup MUST run every configuration check before stopping: the Kafka setup, the upstream settings of each stanza, the topology checks and the Kafka tuning files. If any check fails, startup MUST fail with one error listing every problem found, each naming its stanza (position and topics) where there is one, and the rule it breaks. Warnings MUST be logged and MUST NOT stop startup.
+
+#### Scenario: Three mistakes in one file
+
+- **WHEN** one stanza has `service.port: abc`, another has `on_failure: park`, and `kafka.version` is `2.x`
+- **THEN** startup fails once, and the error names all three problems with their stanzas
+
+#### Scenario: Load-time parse error
+
+- **WHEN** the configuration file is not valid YAML
+- **THEN** startup fails with that parse error alone, as before
+
+### Requirement: Configuration check mode
+
+The binary MUST accept `--check-config`. In that mode it MUST resolve and load the configuration as for a normal start, run exactly the checks startup runs, print each warning and each error, and exit with code 0 if no check failed and 1 otherwise. It MUST NOT connect to Kafka or to any upstream, and MUST NOT create log, metric or audit files.
+
+#### Scenario: Valid configuration
+
+- **WHEN** `bridge-kafka-service --check-config --config app.yaml` runs against a valid file with one unknown key
+- **THEN** the unknown-key warning is printed, a line states that the configuration is valid, and the exit code is 0
+
+#### Scenario: Invalid configuration
+
+- **WHEN** the same command runs against a file with a response-topic cycle
+- **THEN** the error naming the cycle is printed and the exit code is 1
+
+#### Scenario: No side effects
+
+- **WHEN** `--check-config` runs with no broker reachable and the log and metric paths pointing at an empty directory
+- **THEN** the result depends only on the file, and the directory stays empty
+
+### Requirement: No response-topic cycles
+
+For the active stanzas, each input topic leads to the stanza's `response_topic`, when one is set. Startup MUST fail if these links form a cycle, naming the topics and stanzas on it. A stanza whose `response_topic` is one of its own input topics is a cycle. A chain without a cycle MUST be accepted.
+
+#### Scenario: Self loop
+
+- **WHEN** an active stanza reads `orders` and has `response_topic: orders`
+- **THEN** startup fails with an error naming the stanza and `orders`
+
+#### Scenario: Loop through two stanzas
+
+- **WHEN** stanza A reads `a` and responds to `b`, and stanza B reads `b` and responds to `a`
+- **THEN** startup fails with an error naming both stanzas and the topics `a` and `b`
+
+#### Scenario: Chain
+
+- **WHEN** stanza A reads `a` and responds to `b`, and stanza B reads `b` and responds to `c`
+- **THEN** startup proceeds
+
+#### Scenario: Disabled stanza ignored
+
+- **WHEN** a stanza without topics has `response_topic: a` and an active stanza reads `a`
+- **THEN** this check does not stop startup
+
+### Requirement: Consumer groups do not share topics
+
+Startup MUST fail if two active stanzas have the same `group` and at least one topic in common, naming both stanzas, the group and the shared topics. Two active stanzas with the same `group` and no topic in common MUST be accepted with a warning that they rebalance together. The same topic in different groups MUST be accepted without a warning.
+
+#### Scenario: Shared group and topic
+
+- **WHEN** two active stanzas both have `group: bridge` and both read `orders`
+- **THEN** startup fails with an error naming both stanzas, `bridge` and `orders`
+
+#### Scenario: Shared group, disjoint topics
+
+- **WHEN** two active stanzas have `group: bridge` and read `orders` and `payments`
+- **THEN** startup proceeds and a warning names both stanzas and the group
+
+#### Scenario: Fan-out across groups
+
+- **WHEN** two active stanzas read `orders` with groups `g1` and `g2`
+- **THEN** startup proceeds without a warning
+
+### Requirement: Configuration entries are not empty
+
+A `consumer` or `producer` list entry that is empty (for example `- ~`) MUST stop startup with an error naming its list and position. It MUST NOT crash the process, and an empty `consumer` entry MUST NOT be treated as a disabled stanza; a stanza is disabled only by having no topics.
+
+#### Scenario: Empty entry
+
+- **WHEN** the second `consumer` entry is `~`
+- **THEN** startup fails with an error naming consumer #2, and the process does not panic
+
+#### Scenario: Empty producer entry
+
+- **WHEN** the second `producer` entry is `~`
+- **THEN** startup fails with an error naming producer #2, and the process does not panic
+
+#### Scenario: Stanza without topics
+
+- **WHEN** a `consumer` entry has a group and a service but no topics
+- **THEN** it is disabled as before and this check does not stop startup
+
+### Requirement: Kafka version is valid and supports consumer groups
+
+When at least one consumer stanza is active, startup MUST fail if `kafka.version` parses to a Kafka version below 0.10.2, the minimum required by consumer groups; the error MUST name the configured value and the minimum. An empty `kafka.version` MUST keep the default (2.7.0). A non-empty value that cannot be parsed MUST stop startup with an error naming the value, whether or not consumers or producers are configured. A configuration without active consumer stanzas MUST NOT be checked by the minimum of this requirement (producers are checked by "Kafka version supports record headers").
+
+#### Scenario: Version too old for consumer groups
+
+- **WHEN** `kafka.version` is `0.10.1.0` and a consumer stanza has topics
+- **THEN** startup fails before the HTTP server starts, with an error naming `0.10.1.0` and the minimum `0.10.2`
+
+#### Scenario: Minimum version accepted
+
+- **WHEN** `kafka.version` is `0.10.2.0`, a consumer stanza has topics and no producer is configured
+- **THEN** startup proceeds
+
+#### Scenario: Empty version keeps the default
+
+- **WHEN** `kafka.version` is not set
+- **THEN** startup proceeds and Kafka clients use version 2.7.0
+
+#### Scenario: Unparseable version stops startup
+
+- **WHEN** `kafka.version` is `2.x`
+- **THEN** startup fails before the HTTP server starts, with an error naming `2.x`
+
+#### Scenario: Producer-only configuration
+
+- **WHEN** `kafka.version` is `0.10.1.0` and no consumer stanza has topics
+- **THEN** the consumer-group check does not stop startup, and the record-header check applies instead
+
+### Requirement: Backup retention settings
+
+The configuration MUST accept `retention.max_backups` and `retention.max_age_days`, whole numbers that apply to the backups of both the metric file and the audit file. `0`, the default, MUST mean no limit. A negative or non-numeric value MUST stop startup with an error naming the key and the value. When either limit is set, startup MUST log one line naming both limits and stating that older audit backups will be deleted.
+
+#### Scenario: Defaults
+
+- **WHEN** neither key is set
+- **THEN** every backup is kept and no retention line is logged
+
+#### Scenario: Limits set
+
+- **WHEN** `retention.max_backups: 10` and `retention.max_age_days: 30` are set
+- **THEN** startup logs one line naming both limits, and backups beyond either limit are deleted when the file is first written and at every rotation
+
+#### Scenario: Invalid value
+
+- **WHEN** `retention.max_age_days` is `-1` or `month`
+- **THEN** startup fails with an error naming `retention.max_age_days` and the value
+
 ## Technical Notes
 
 Keys of the application config (checked against this spec by `make docs-check`):
@@ -210,6 +347,8 @@ http.addr:
 pprof.addr:
 audit.grpc_endpoint:
 timeouts.shutdown:
+retention.max_backups:
+retention.max_age_days:
 kafka:
   brokers:
   version:

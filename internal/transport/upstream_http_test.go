@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -147,7 +148,8 @@ func TestHTTPUpstream_SendsBodyAndHeadersAndReturnsResponse(t *testing.T) {
 }
 
 // Frameworks such as FastAPI read a body without Content-Type as plain bytes and
-// reject it, so the JSON body is labelled; a record header still overrides it.
+// reject it, so the JSON body is always labelled application/json; a record header
+// cannot override it.
 func TestHTTPUpstream_ContentType(t *testing.T) {
 	var got string
 	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
@@ -161,7 +163,8 @@ func TestHTTPUpstream_ContentType(t *testing.T) {
 		want    string
 	}{
 		{nil, "application/json"},
-		{map[string]string{"content-type": "application/vnd.api+json"}, "application/vnd.api+json"},
+		{map[string]string{"content-type": "application/vnd.api+json"}, "application/json"},
+		{map[string]string{"Content-Type": "text/plain"}, "application/json"},
 	} {
 		if _, err := up.Call(context.Background(), transport.UpstreamRequest{Body: []byte(`{}`), Headers: tc.headers}); err != nil {
 			t.Fatal(err)
@@ -217,4 +220,58 @@ func TestHTTPUpstream_InvalidAddress(t *testing.T) {
 	conf := &schemas.ConsumerConfig{Service: schemas.HostConfig{Name: "bad host", Port: "x", Path: "/"}}
 	_, err := transport.NewHTTPUpstream(conf).Call(context.Background(), transport.UpstreamRequest{})
 	assert.Error(t, err)
+}
+
+// bodyServer answers every call with n bytes of body.
+func bodyServer(t *testing.T, n int) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.CopyN(w, zeroReader{}, int64(n))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+func TestHTTPUpstream_ResponseOverTheLimitFailsTheCall(t *testing.T) {
+	srv := bodyServer(t, transport.HTTPMaxResponseBytes+1)
+
+	_, err := call(t, upstreamConf(t, srv, ""))
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "exceeds")
+	assert.True(t, transport.IsPermanent(err), "an oversized body depends on the record, not on the network")
+}
+
+func TestHTTPUpstream_ResponseOverTheLimitIsNotRetried(t *testing.T) {
+	transport.FastRetries(t, time.Millisecond, time.Millisecond)
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_, _ = io.CopyN(w, zeroReader{}, int64(transport.HTTPMaxResponseBytes+1))
+	}))
+	t.Cleanup(srv.Close)
+	conf := upstreamConf(t, srv, "")
+	ev, acks := newEvent("")
+
+	transport.SendToServiceRetrying(context.Background(), logger(t), transport.NewHTTPUpstream(conf), ev, nil, time.Second, transport.NewRetryState())
+
+	assert.Equal(t, int32(1), calls.Load(), "the call is made once")
+	assert.Equal(t, 1, ev.Event.Failure)
+	assert.Equal(t, 1, *acks, "the offset is settled")
+}
+
+func TestHTTPUpstream_ResponseAtTheLimitIsRead(t *testing.T) {
+	srv := bodyServer(t, transport.HTTPMaxResponseBytes)
+
+	resp, err := call(t, upstreamConf(t, srv, ""))
+
+	require.NoError(t, err)
+	assert.Len(t, resp.Body, transport.HTTPMaxResponseBytes)
 }

@@ -46,45 +46,71 @@ For every event the system MUST append a JSON-formatted log line containing the 
 - **THEN** its duration is `0` and processing continues
 
 ### Requirement: gRPC delivery when configured
-When an operator supplies a gRPC endpoint address, the system MUST attempt to deliver each audit entry over a streaming gRPC client using the Envoy Access Log Service protocol. The connection is established lazily and never blocks startup. Successful delivery MAY close the stream; transient errors, including a rejecting or unreachable receiver, MUST NOT abort processing or lose the file fallback entry.
+
+When an operator supplies a gRPC endpoint address, the system MUST attempt to deliver audit entries over a streaming gRPC client using the Envoy Access Log Service protocol, after they have been written to the local audit file. Entries MAY be sent in batches over one stream per batch. The connection is established lazily and never blocks startup. Delivery MUST NOT delay the pipeline: when the gRPC delivery queue is full, an entry MUST be dropped from gRPC delivery only (it stays in the local audit file), and dropped entries MUST be counted and reported in a warning at most once per minute. Transient errors, including a rejecting or unreachable receiver, MUST NOT abort processing or lose the file fallback entry.
 
 #### Scenario: Endpoint reachable
+
 - **WHEN** the configured gRPC endpoint accepts the connection over insecure transport
-- **THEN** each audit entry is sent via a fresh short-lived stream that is closed after receipt acknowledgement
+- **THEN** every audit entry is delivered, several entries per stream when they are queued together, and each stream is closed after receipt acknowledgement
 
 #### Scenario: Endpoint unreachable at boot
+
 - **WHEN** the configured endpoint cannot be reached (or its address is unusable)
-- **THEN** startup still succeeds, each delivery attempt fails with a logged error (or a warning when the address cannot be dialled at all, in which case no gRPC client is kept), and audit entries still flow to the local fallback described below
+- **THEN** startup still succeeds, delivery attempts fail with a logged error (or a warning when the address cannot be dialled at all, in which case no gRPC client is kept), and audit entries still flow to the local fallback described below
 
 #### Scenario: Receiver rejects entries
+
 - **WHEN** the gRPC receiver answers with an error
 - **THEN** the error is logged, processing continues, and every entry is still written to the local audit file
 
+#### Scenario: Slow receiver
+
+- **WHEN** the receiver takes 3 seconds to answer each stream while records are consumed at full rate
+- **THEN** consumption is not slowed by audit delivery, every entry is in the local audit file, and a warning reports how many entries were not delivered over gRPC
+
 ### Requirement: Local file fallback always active
-Independent of the gRPC configuration status, the system MUST append every audit entry as a JSON-lines file next to the main metric file. This guarantees zero-loss auditing even in disconnected environments.
+
+Independent of the gRPC configuration status, the system MUST append every audit entry as a JSON-lines file next to the main metric file, without ever dropping one. Entries MUST be written in emission order and flushed to disk at least once per second, and before shutdown completes. When the file writer falls behind, emitting an entry MUST wait for the writer rather than drop the entry. This guarantees zero-loss auditing even in disconnected environments.
 
 #### Scenario: Audit persists without network
+
 - **WHEN** no gRPC endpoint is configured
-- **THEN** each audit entry appears verbatim in the local audit file synchronously after emission
+- **THEN** each audit entry appears verbatim in the local audit file within one second of emission
 
 #### Scenario: Crash recovery
+
 - **WHEN** the process restarts after abnormal termination
-- **THEN** previously appended audit lines remain intact (append-mode writes)
+- **THEN** previously appended audit lines remain intact (append-mode writes), and at most the entries of the last second before the crash are missing
+
+#### Scenario: Burst larger than the queue
+
+- **WHEN** many more audit entries are emitted at once than the file queue holds
+- **THEN** every entry is written to the audit file, none is dropped
 
 ### Requirement: Flush on shutdown and non-blocking producers
-On shutdown the metric and audit loops MUST write every event already queued before files and the gRPC connection are closed; all resources MUST be closed even if closing one of them fails. Reporting an audit error MUST never block the audit loop itself (the error queue is bounded and drained by that same loop).
+
+On shutdown the metric and audit loops MUST write every event already queued before files and the gRPC connection are closed; all resources MUST be closed even if closing one of them fails. Entries still waiting for gRPC delivery at shutdown MUST get at most one bounded delivery attempt. Emitting a metric event or an audit entry MUST never wait for the gRPC receiver; it MAY wait only for the local file writers. Reporting an audit error MUST never block the audit loop itself (the error queue is bounded and drained by that same loop).
 
 #### Scenario: Queued events survive shutdown
+
 - **WHEN** events are queued and shutdown starts
 - **THEN** the metric file contains a line set for every queued event and the audit file contains every queued entry
 
 #### Scenario: Repeated audit failures
+
 - **WHEN** the audit file fails to write several times in a row
 - **THEN** the loop keeps running, excess errors are logged directly, and no deadlock occurs
 
 #### Scenario: Shutdown is idempotent
+
 - **WHEN** shutdown is requested twice
 - **THEN** the second call is a no-op
+
+#### Scenario: Shutdown with an unreachable receiver
+
+- **WHEN** shutdown starts while entries wait for gRPC delivery and the receiver does not answer
+- **THEN** shutdown completes within the gRPC attempt timeout, and every entry is in the audit file
 
 ### Requirement: Outbound HTTP call diagnostics
 When the system makes an outbound call to a configured upstream, it MUST emit DNS-resolution logs at debug level for every request and additional request/response summary logs covering method, URL, status code, and elapsed seconds. Failures MUST include the originating host so operators can correlate incidents to specific upstreams.
@@ -140,3 +166,32 @@ Every observable transition at pipeline boundaries (downstream-start, downstream
 #### Scenario: Egress entry on publish
 - **WHEN** a response or manual publish completes
 - **THEN** an egress-type ALS entry is emitted with the published payload and shared headers
+
+### Requirement: Metric and audit file rotation
+
+The metric file and the audit file MUST be rotated by size (at 100 MB) into compressed backups next to them. By default no backup MUST be deleted by the service, so no metric line or audit entry is lost to rotation. When backup retention is configured (see `app-configuration` "Backup retention settings"), the service MUST delete the backups of each file beyond the configured count or older than the configured age, and MUST NOT delete the current file. New metric, audit and backup files MUST be readable and writable only by the service's user (mode `0600`).
+
+#### Scenario: File reaches the size limit
+
+- **WHEN** the audit file reaches 100 MB
+- **THEN** it is renamed to a timestamped backup and compressed, a new audit file is started, and no entry is lost across the switch
+
+#### Scenario: Backups are kept
+
+- **WHEN** the metric file has been rotated many times and no retention is configured
+- **THEN** every backup still exists
+
+#### Scenario: Backups beyond the count are deleted
+
+- **WHEN** `retention.max_backups` is `3` and the audit file has been rotated five times
+- **THEN** the three newest audit backups exist, the two oldest are deleted, and the current audit file is untouched
+
+#### Scenario: Backups beyond the age are deleted
+
+- **WHEN** `retention.max_age_days` is `30` and the metric file rotates while a 40-day-old backup exists
+- **THEN** the 40-day-old backup is deleted and younger backups are kept
+
+#### Scenario: File permissions
+
+- **WHEN** the service creates the metric or audit file
+- **THEN** the file is readable and writable only by its owner

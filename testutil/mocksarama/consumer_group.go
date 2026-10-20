@@ -1,8 +1,10 @@
 package mocksarama
 
 // A hand-rolled fake of sarama's Client, ConsumerGroup, session and claim for unit tests of the
-// consume orchestration. It does not model rebalancing, commits or heartbeats: behaviour against
-// a real broker still needs an integration test.
+// consume orchestration. Like sarama, a session ends by cancelling its context, waiting for every
+// ConsumeClaim to return, calling Cleanup and then releasing: marks made after the release are
+// dropped. EndSession simulates a rebalance. Commits and heartbeats are not modelled: behaviour
+// against a real broker still needs an integration test.
 
 import (
 	"context"
@@ -119,6 +121,9 @@ type FakeConsumerGroup struct {
 	closed     bool
 	markMu     sync.Mutex
 	marked     []int64
+	sessMu     sync.Mutex
+	endSession context.CancelFunc
+	sessions   int32
 }
 
 // NewFakeConsumerGroup returns a fake group over client.
@@ -151,6 +156,11 @@ func (g *FakeConsumerGroup) Consume(ctx context.Context, topics []string, handle
 	runCtx, cancel := context.WithCancel(ctx)
 	g.cancelOnce.Do(func() { g.cancel = cancel })
 
+	g.sessMu.Lock()
+	g.endSession = cancel
+	g.sessMu.Unlock()
+	atomic.AddInt32(&g.sessions, 1)
+
 	sess := &fakeSession{ctx: runCtx, group: g}
 	if err := handler.Setup(sess); err != nil {
 		cancel()
@@ -180,10 +190,12 @@ func (g *FakeConsumerGroup) Consume(ctx context.Context, topics []string, handle
 	case <-runCtx.Done():
 	}
 
+	cancel()
+	<-done
 	if err := handler.Cleanup(sess); err != nil {
 		cleanupErr = err
 	}
-	cancel()
+	sess.released.Store(true)
 	if cleanupErr != nil {
 		return cleanupErr
 	}
@@ -192,6 +204,20 @@ func (g *FakeConsumerGroup) Consume(ctx context.Context, topics []string, handle
 	}
 	return nil
 }
+
+// EndSession ends the current session the way a rebalance does: its context is cancelled while
+// the group keeps running, so the caller's next Consume starts a new session.
+func (g *FakeConsumerGroup) EndSession() {
+	g.sessMu.Lock()
+	end := g.endSession
+	g.sessMu.Unlock()
+	if end != nil {
+		end()
+	}
+}
+
+// Sessions reports how many sessions Consume has started.
+func (g *FakeConsumerGroup) Sessions() int { return int(atomic.LoadInt32(&g.sessions)) }
 
 // Errors returns nil: the fake reports no asynchronous errors.
 func (g *FakeConsumerGroup) Errors() <-chan error { return nil }
@@ -224,10 +250,12 @@ func (g *FakeConsumerGroup) ResumeAll()                { atomic.AddInt32(&g.resu
 
 // fakeSession is the ConsumerGroupSession handed to handlers: its context is
 // the one derived from Consume's ctx (so handlers can read values the caller
-// attached and observe cancellation) and every MarkMessage is recorded.
+// attached and observe cancellation). MarkMessage is recorded until the session
+// is released; later marks are dropped, as sarama drops them.
 type fakeSession struct {
-	ctx   context.Context
-	group *FakeConsumerGroup
+	ctx      context.Context
+	group    *FakeConsumerGroup
+	released atomic.Bool
 }
 
 func (*fakeSession) Claims() map[string][]int32               { return nil }
@@ -238,6 +266,9 @@ func (*fakeSession) Commit()                                  {}
 func (*fakeSession) ResetOffset(string, int32, int64, string) {}
 func (s *fakeSession) Context() context.Context               { return s.ctx }
 func (s *fakeSession) MarkMessage(m *sarama.ConsumerMessage, _ string) {
+	if s.released.Load() {
+		return
+	}
 	s.group.markMu.Lock()
 	defer s.group.markMu.Unlock()
 	s.group.marked = append(s.group.marked, m.Offset)

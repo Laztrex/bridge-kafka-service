@@ -14,14 +14,13 @@ import (
 
 func TestProcessHeaders_GeneratesMissingAndKeepsGiven(t *testing.T) {
 	h := http.Header{}
-	got, err := ProcessHeaders(h)
-	require.NoError(t, err)
+	got := ProcessHeaders(h)
 	assert.Len(t, got[consts.HeaderRequestIdKey], 36)
 	assert.Equal(t, got[consts.HeaderRequestIdKey], got[consts.HeaderTraceIdKey], "trace id mirrors request id")
 	assert.NotEmpty(t, got[consts.HeaderRequestTimeKey])
 
 	h.Set(consts.HeaderRequestIdKey, "given")
-	got, _ = ProcessHeaders(h)
+	got = ProcessHeaders(h)
 	assert.Equal(t, "given", got[consts.HeaderRequestIdKey])
 	assert.Equal(t, "given", got[consts.HeaderTraceIdKey])
 }
@@ -45,7 +44,7 @@ func TestHeaderHttpHandler_LiftsCustomHeadersFromResponse(t *testing.T) {
 	header.Set(consts.CustomHeaderPrefix+"k", "v")
 	body := &schemas.RequestBody{Headers: map[string]string{}}
 
-	require.NoError(t, HeaderHttpHandler(header, body))
+	HeaderHttpHandler(header, body)
 
 	assert.Equal(t, "rid", body.Headers[consts.HeaderRequestIdKey])
 	assert.Equal(t, "v", body.Headers["K"])

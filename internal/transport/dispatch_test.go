@@ -1,7 +1,9 @@
 package transport_test
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -9,6 +11,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,6 +26,7 @@ import (
 	"bridge-kafka-service/internal/transport"
 	"bridge-kafka-service/testutil/fakeclock"
 	"bridge-kafka-service/testutil/metricsfile"
+	"bridge-kafka-service/testutil/mockmodel"
 )
 
 func upstreamConf(t *testing.T, srv *httptest.Server, responseTopic string) *schemas.ConsumerConfig {
@@ -194,7 +199,7 @@ func TestSlowModeCapsConcurrency(t *testing.T) {
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
-		transport.ConsumerResponseSlow(logger(t), conf, transport.NewHTTPUpstream(conf), ch, q, ctxFrom(ctxDone))
+		transport.ConsumerResponseSlow(logger(t), conf, transport.NewHTTPUpstream(conf), ch, q, ctxFrom(ctxDone), nil)
 	}()
 
 	var acked = make(chan struct{}, 6)
@@ -231,7 +236,7 @@ func TestFastModeBelowCeilingDispatchesAllConcurrently(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, q, ctxFrom(make(chan struct{})))
+		transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, q, ctxFrom(make(chan struct{})), nil)
 	}()
 
 	for i := 0; i < 5; i++ {
@@ -266,7 +271,7 @@ func TestFastModeCeilingHoldsBackFurtherCalls(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, q, ctxFrom(make(chan struct{})))
+		transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, q, ctxFrom(make(chan struct{})), nil)
 	}()
 
 	for i := 0; i < 5; i++ {
@@ -307,7 +312,7 @@ func TestFastModeShutdownAtCeilingLeavesWaitingRecordUnsettled(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, q, ctxFrom(stop))
+		transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, q, ctxFrom(stop), nil)
 	}()
 
 	flying, _ := newEvent("")
@@ -354,9 +359,9 @@ func runPipelines(t *testing.T, conf *schemas.ConsumerConfig, total int, slowMod
 	go func() {
 		defer close(done)
 		if slowMode {
-			transport.ConsumerResponseSlow(logger(t), conf, transport.NewHTTPUpstream(conf), ch, nil, ctxFrom(make(chan struct{})))
+			transport.ConsumerResponseSlow(logger(t), conf, transport.NewHTTPUpstream(conf), ch, nil, ctxFrom(make(chan struct{})), nil)
 		} else {
-			transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, nil, ctxFrom(make(chan struct{})))
+			transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, nil, ctxFrom(make(chan struct{})), nil)
 		}
 	}()
 
@@ -387,7 +392,7 @@ func TestHTTPUpstreamReusesConnections_SlowMode(t *testing.T) {
 
 	// The pool must reuse connections: 200 calls through a pool sized to the
 	// limit open far fewer connections than calls. The bound is the limit plus
-	// slack, not the exact limit: with MaxConnsPerHost = 0 (design D3, the
+	// slack, not the exact limit: with MaxConnsPerHost = 0 (baseline decision DEL-6, the
 	// semaphore is the only cap) net/http briefly dials a new connection when
 	// a request starts exactly while a finished connection is still returning
 	// to the idle pool. Without a per-host pool the 200 calls would open ~200
@@ -431,9 +436,9 @@ func TestDispatcherStopsOnContextCancel(t *testing.T) {
 			go func() {
 				defer close(done)
 				if maxConn > 0 {
-					transport.ConsumerResponseSlow(logger(t), conf, transport.NewHTTPUpstream(conf), ch, nil, ctxFrom(stop))
+					transport.ConsumerResponseSlow(logger(t), conf, transport.NewHTTPUpstream(conf), ch, nil, ctxFrom(stop), nil)
 				} else {
-					transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, nil, ctxFrom(stop))
+					transport.ConsumerResponseFast(logger(t), conf, transport.NewHTTPUpstream(conf), ch, nil, ctxFrom(stop), nil)
 				}
 			}()
 			for i := 0; i < 2; i++ {
@@ -568,4 +573,347 @@ func TestRequestServiceEventHasNonZeroDuration(t *testing.T) {
 	l.Shutdown()
 
 	assert.Positive(t, metricsfile.Durations(t, file, consts.EventRequestService)["req-1"])
+}
+
+// countingUpstream fails every call with err and counts the calls.
+type countingUpstream struct {
+	calls atomic.Int32
+	err   error
+}
+
+func (c *countingUpstream) Call(context.Context, transport.UpstreamRequest) (transport.UpstreamResponse, error) {
+	c.calls.Add(1)
+	return transport.UpstreamResponse{}, c.err
+}
+
+// failingFor returns the failing_for values (milliseconds) of the log lines carrying msg, in order.
+func failingFor(t *testing.T, logs *syncBuffer, msg string) []float64 {
+	t.Helper()
+	logs.mu.Lock()
+	text := logs.b.String()
+	logs.mu.Unlock()
+	var out []float64
+	sc := bufio.NewScanner(strings.NewReader(text))
+	for sc.Scan() {
+		var line map[string]any
+		require.NoError(t, json.Unmarshal(sc.Bytes(), &line))
+		if line["message"] != msg {
+			continue
+		}
+		v, ok := line["failing_for"].(float64)
+		require.True(t, ok, "failing_for missing in %s", sc.Text())
+		out = append(out, v)
+	}
+	return out
+}
+
+func TestPermanentFailure_RetryPipelineSettlesAfterOneAttempt(t *testing.T) {
+	transport.FastRetries(t, time.Millisecond, time.Millisecond)
+	up := &countingUpstream{err: transport.Permanent(errors.New("response body too large"))}
+	ev, acks := newEvent("")
+
+	transport.SendToServiceRetrying(context.Background(), logger(t), up, ev, nil, time.Second, transport.NewRetryState())
+
+	assert.Equal(t, int32(1), up.calls.Load(), "a permanent failure is not retried")
+	assert.Equal(t, 1, ev.Event.Failure)
+	assert.Equal(t, 1, *acks, "the offset is settled")
+}
+
+func TestPermanentFailure_SequentialRetryPipelineGoesOn(t *testing.T) {
+	transport.FastRetries(t, time.Millisecond, time.Millisecond)
+	var calls atomic.Int32
+	up := upstreamFunc(func(transport.UpstreamRequest) (transport.UpstreamResponse, error) {
+		if calls.Add(1) == 1 {
+			return transport.UpstreamResponse{}, transport.Permanent(errors.New("response body too large"))
+		}
+		return transport.UpstreamResponse{Body: []byte(`{}`)}, nil
+	})
+	conf := &schemas.ConsumerConfig{OnFailure: schemas.FailureRetry, Service: schemas.HostConfig{MaxConn: 1, Timeout: time.Second}}
+	ch := make(chan *schemas.ConsumerEvent, 2)
+	var acks atomic.Int32
+	for range 2 {
+		ev, _ := newEvent("")
+		ev.SetAck(func() { acks.Add(1) })
+		ch <- ev
+	}
+	close(ch)
+
+	transport.ConsumerResponseSlow(logger(t), conf, up, ch, nil, context.Background(), nil)
+
+	assert.Equal(t, int32(2), calls.Load(), "one attempt per record")
+	assert.Equal(t, int32(2), acks.Load(), "both records are settled, the pipeline does not stall")
+}
+
+func TestPermanentFailure_SkipPipelineSettlesOnce(t *testing.T) {
+	up := &countingUpstream{err: transport.Permanent(errors.New("response body too large"))}
+	ev, acks := newEvent("")
+
+	transport.SendToService(context.Background(), logger(t), up, ev, nil, time.Second)
+
+	assert.Equal(t, int32(1), up.calls.Load())
+	assert.Equal(t, 1, ev.Event.Failure)
+	assert.Equal(t, 1, *acks)
+}
+
+func TestPermanentFailure_ConnectionErrorIsStillRetried(t *testing.T) {
+	transport.FastRetries(t, time.Millisecond, time.Millisecond)
+	up := &scriptedUpstream{fail: func(call int32) bool { return call <= 2 }}
+	ev, _ := newEvent("")
+
+	transport.SendToServiceRetrying(context.Background(), logger(t), up, ev, nil, time.Second, transport.NewRetryState())
+
+	assert.Equal(t, int32(3), up.calls.Load())
+	assert.Equal(t, 1, ev.Event.Success)
+	assert.False(t, transport.IsPermanent(errDown))
+}
+
+func TestRetry_WarningStatesHowLongTheRecordHasBeenFailing(t *testing.T) {
+	transport.FastRetries(t, 5*time.Millisecond, 5*time.Millisecond)
+	logs := captureLog(t)
+	up := &scriptedUpstream{fail: func(call int32) bool { return call <= 3 }}
+	ev, _ := newEvent("")
+
+	transport.SendToServiceRetrying(context.Background(), logger(t), up, ev, nil, time.Second, transport.NewRetryState())
+
+	got := failingFor(t, logs, "upstream call failed, retrying")
+	require.Len(t, got, 3)
+	assert.Less(t, got[0], got[1])
+	assert.Less(t, got[1], got[2])
+}
+
+// blockingUpstream answers after `after`, or fails with the context's error if
+// the call is cancelled first (what a real transport does).
+type blockingUpstream struct {
+	after   time.Duration
+	started chan struct{}
+}
+
+func newBlocking(after time.Duration) *blockingUpstream {
+	return &blockingUpstream{after: after, started: make(chan struct{}, 16)}
+}
+
+func (b *blockingUpstream) Call(ctx context.Context, _ transport.UpstreamRequest) (transport.UpstreamResponse, error) {
+	b.started <- struct{}{}
+	select {
+	case <-time.After(b.after):
+		return transport.UpstreamResponse{Body: []byte(`{}`)}, nil
+	case <-ctx.Done():
+		return transport.UpstreamResponse{}, ctx.Err()
+	}
+}
+
+// pipeline runs ConsumerResponseFast over one event and stops it the way
+// RunSubscription does on shutdown: by closing the input channel.
+type pipeline struct {
+	ev    *schemas.ConsumerEvent
+	acks  atomic.Int32
+	ch    chan *schemas.ConsumerEvent
+	done  chan struct{}
+	file  string
+	ended time.Time
+}
+
+func startPipeline(t *testing.T, upstream transport.Upstream, conf *schemas.ConsumerConfig, drain time.Duration) *pipeline {
+	conf.DrainWindow = drain
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "m.log")
+	l, err := observability.NewFileTransactionLogger(file, "")
+	require.NoError(t, err)
+	l.Run()
+	t.Cleanup(l.Shutdown)
+
+	p := &pipeline{ch: make(chan *schemas.ConsumerEvent, 1), done: make(chan struct{}), file: file}
+	p.ev, _ = newEvent("")
+	p.ev.SetAck(func() { p.acks.Add(1) })
+
+	go func() {
+		defer close(p.done)
+		transport.ConsumerResponseFast(l, conf, upstream, p.ch, nil, context.Background(), nil)
+		p.ended = time.Now()
+	}()
+	p.ch <- p.ev
+	return p
+}
+
+// stop closes the input and waits for the pipeline to return, reporting how long it took.
+func (p *pipeline) stop(t *testing.T, within time.Duration) time.Duration {
+	t.Helper()
+	began := time.Now()
+	close(p.ch)
+	select {
+	case <-p.done:
+	case <-time.After(within):
+		t.Fatalf("pipeline did not stop within %v", within)
+	}
+	return p.ended.Sub(began)
+}
+
+func goroutinesSettleTo(t *testing.T, baseline int) {
+	t.Helper()
+	assert.Eventually(t, func() bool { return runtime.NumGoroutine() <= baseline+2 }, 5*time.Second, 50*time.Millisecond,
+		"goroutines leaked: %d now, %d before", runtime.NumGoroutine(), baseline)
+}
+
+func TestLifecycle_CallFinishingInsideTheDrainWindowIsSettledNormally(t *testing.T) {
+	up := newBlocking(200 * time.Millisecond)
+	p := startPipeline(t, up, &schemas.ConsumerConfig{Service: schemas.HostConfig{Timeout: 30 * time.Second}}, 5*time.Second)
+	<-up.started
+
+	took := p.stop(t, 3*time.Second)
+
+	assert.GreaterOrEqual(t, took, 100*time.Millisecond, "the pipeline waited for the in-flight call")
+	assert.Equal(t, int32(1), p.acks.Load(), "the offset is settled")
+	assert.Equal(t, 1, p.ev.Event.Success)
+}
+
+func TestLifecycle_CallOutlivingTheDrainWindowIsAbandonedNotSettled(t *testing.T) {
+	baseline := runtime.NumGoroutine()
+	up := newBlocking(time.Hour)
+	p := startPipeline(t, up, &schemas.ConsumerConfig{Service: schemas.HostConfig{Timeout: 30 * time.Second}}, 150*time.Millisecond)
+	<-up.started
+
+	took := p.stop(t, 3*time.Second)
+
+	assert.GreaterOrEqual(t, took, 100*time.Millisecond, "it waited for the whole window first")
+	assert.Zero(t, p.acks.Load(), "an abandoned record must stay unsettled so it is redelivered")
+	assert.Zero(t, p.ev.Event.Failure, "an interrupted call is not a service failure")
+	assert.Zero(t, p.ev.Event.Success)
+	assert.Empty(t, metricsfile.Durations(t, p.file, consts.EventRequestService), "no metric is recorded for an abandoned call")
+	goroutinesSettleTo(t, baseline)
+}
+
+func TestLifecycle_RealFailureWhileRunningIsStillAFailureAndSettled(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	conf := upstreamConf(t, srv, "")
+	conf.Service.Timeout = time.Second
+	srv.Close()
+	p := startPipeline(t, transport.NewHTTPUpstream(conf), conf, time.Second)
+
+	p.stop(t, 3*time.Second)
+
+	assert.Equal(t, int32(1), p.acks.Load())
+	assert.Equal(t, 1, p.ev.Event.Failure)
+}
+
+func TestLifecycle_HTTPCallOutlivingTheWindowIsAbandoned(t *testing.T) {
+	started := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		started <- struct{}{}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	conf := upstreamConf(t, srv, "")
+	conf.Service.Timeout = 30 * time.Second
+	p := startPipeline(t, transport.NewHTTPUpstream(conf), conf, 150*time.Millisecond)
+	<-started
+
+	p.stop(t, 3*time.Second)
+
+	assert.Zero(t, p.acks.Load())
+	assert.Zero(t, p.ev.Event.Failure)
+}
+
+func TestLifecycle_GRPCCallOutlivingTheWindowIsAbandonedAndConnectionCloses(t *testing.T) {
+	srv := mockmodel.Start(t)
+	srv.Delay(time.Hour)
+	conf := grpcConf(t, srv.Addr, schemas.ServiceTLS{})
+	conf.Service.Timeout = 30 * time.Second
+	up, err := transport.NewUpstream(conf)
+	require.NoError(t, err)
+	p := startPipeline(t, up, conf, 150*time.Millisecond)
+	require.Eventually(t, func() bool { return len(srv.Requests()) == 1 }, 3*time.Second, 20*time.Millisecond)
+
+	p.stop(t, 3*time.Second)
+
+	assert.Zero(t, p.acks.Load())
+	assert.Zero(t, p.ev.Event.Failure)
+	assert.NoError(t, up.(io.Closer).Close(), "the connection can be closed once the calls are gone")
+}
+
+// claimEvent is an event of a claim whose session ends when the returned cancel is called; it
+// counts its acks and abandons.
+func claimEvent(t *testing.T, id string) (ev *schemas.ConsumerEvent, endClaim context.CancelFunc, acks, abandons *atomic.Int32) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	ev, _ = newEvent("")
+	ev.Values.RequestId = id
+	acks, abandons = &atomic.Int32{}, &atomic.Int32{}
+	ev.ClaimCtx = ctx
+	ev.SetAck(func() { acks.Add(1) })
+	ev.SetAbandon(func() { abandons.Add(1) })
+	return ev, cancel, acks, abandons
+}
+
+// runDispatcher runs a slow-mode dispatcher with max_conn slots over ch until the test ends.
+func runDispatcher(t *testing.T, up transport.Upstream, maxConn int, policy string) chan *schemas.ConsumerEvent {
+	t.Helper()
+	conf := &schemas.ConsumerConfig{OnFailure: policy, Service: schemas.HostConfig{MaxConn: maxConn, Timeout: 5 * time.Second}, DrainWindow: 100 * time.Millisecond}
+	ch := make(chan *schemas.ConsumerEvent, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); transport.ConsumerResponseSlow(logger(t), conf, up, ch, nil, ctx, nil) }()
+	t.Cleanup(func() { cancel(); <-done })
+	return ch
+}
+
+func TestDispatch_RecordOfAnEndedClaimIsNotSent(t *testing.T) {
+	var calls atomic.Int32
+	up := upstreamFunc(func(transport.UpstreamRequest) (transport.UpstreamResponse, error) {
+		calls.Add(1)
+		return transport.UpstreamResponse{Body: []byte(`{}`)}, nil
+	})
+	ch := runDispatcher(t, up, 1, schemas.FailureSkip)
+
+	ev, endClaim, acks, abandons := claimEvent(t, "ended")
+	endClaim()
+	ch <- ev
+
+	require.Eventually(t, func() bool { return abandons.Load() == 1 }, 3*time.Second, 5*time.Millisecond)
+	assert.Zero(t, calls.Load(), "the upstream is not called for a record of an ended claim")
+	assert.Zero(t, acks.Load(), "the record is not settled")
+}
+
+func TestDispatch_SlotWaitEndsWhenTheClaimEnds(t *testing.T) {
+	release := make(chan struct{})
+	var calls atomic.Int32
+	up := upstreamFunc(func(transport.UpstreamRequest) (transport.UpstreamResponse, error) {
+		calls.Add(1)
+		<-release
+		return transport.UpstreamResponse{Body: []byte(`{}`)}, nil
+	})
+	ch := runDispatcher(t, up, 1, schemas.FailureSkip)
+	t.Cleanup(func() { close(release) }) // runs before the dispatcher's cleanup, which waits for this call
+
+	busy, _, _, _ := claimEvent(t, "busy")
+	ch <- busy
+	require.Eventually(t, func() bool { return calls.Load() == 1 }, 3*time.Second, 5*time.Millisecond)
+
+	waiting, endClaim, acks, abandons := claimEvent(t, "waiting")
+	ch <- waiting
+	time.Sleep(50 * time.Millisecond)
+	endClaim()
+
+	require.Eventually(t, func() bool { return abandons.Load() == 1 }, 3*time.Second, 5*time.Millisecond,
+		"a record waiting for a slot is given up as soon as its claim ends")
+	assert.Equal(t, int32(1), calls.Load())
+	assert.Zero(t, acks.Load())
+}
+
+func TestDispatch_UpstreamRetryStopsWhenTheClaimEnds(t *testing.T) {
+	transport.FastRetries(t, 20*time.Millisecond, 20*time.Millisecond)
+	up := &scriptedUpstream{fail: func(int32) bool { return true }}
+	ch := runDispatcher(t, up, 1, schemas.FailureRetry)
+
+	ev, endClaim, acks, abandons := claimEvent(t, "retrying")
+	ch <- ev
+	require.Eventually(t, func() bool { return up.calls.Load() >= 2 }, 3*time.Second, 5*time.Millisecond)
+	endClaim()
+
+	require.Eventually(t, func() bool { return abandons.Load() == 1 }, 3*time.Second, 5*time.Millisecond)
+	stopped := up.calls.Load()
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, stopped, up.calls.Load(), "no more upstream calls after the claim ended")
+	assert.Zero(t, acks.Load())
 }

@@ -3,6 +3,7 @@ package codec
 import (
 	"encoding/base64"
 	"encoding/json"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -35,9 +36,11 @@ func coerceValue(value []byte) json.RawMessage {
 	return quoted
 }
 
-// GetConsumeMsg extracts the body and headers from a consumed Kafka record,
-// coercing non-JSON payloads into a canonical JSON shape.
-func GetConsumeMsg(msg *sarama.ConsumerMessage, body *schemas.RequestBody) {
+// GetConsumeMsg extracts the body and headers from a consumed Kafka record, coercing non-JSON
+// payloads into a canonical JSON shape, and returns the record's request id. Absent x-request-id
+// and x-client-id get defaults unless listed in consts.RequiredHeaders; a request id is generated
+// for logs and audit either way.
+func GetConsumeMsg(msg *sarama.ConsumerMessage, body *schemas.RequestBody) string {
 	body.Data = coerceValue(msg.Value)
 
 	headers := map[string]string{}
@@ -55,22 +58,56 @@ func GetConsumeMsg(msg *sarama.ConsumerMessage, body *schemas.RequestBody) {
 		}
 	}
 
-	_, ok := headers[consts.HeaderRequestIdKey]
+	normalizeTrackingHeaders(headers)
+
+	requestId, ok := headers[consts.HeaderRequestIdKey]
 	if !ok {
-		headers[consts.HeaderRequestIdKey] = NewRequestID()
+		requestId = NewRequestID()
+		if !consts.IsRequiredHeader(consts.HeaderRequestIdKey) {
+			headers[consts.HeaderRequestIdKey] = requestId
+		}
 	}
-	_, ok = headers[consts.HeaderClientId]
-	if !ok {
+	if _, ok = headers[consts.HeaderClientId]; !ok && !consts.IsRequiredHeader(consts.HeaderClientId) {
 		headers[consts.HeaderClientId] = SystemID()
 	}
 
-	log.Info().Str(consts.HeaderRequestIdKey, headers[consts.HeaderRequestIdKey]).
+	log.Info().Str(consts.HeaderRequestIdKey, requestId).
 		Msgf("message claimed: timestamp = %v, topic = %s", msg.Timestamp, msg.Topic)
 
-	log.Debug().Str(consts.HeaderRequestIdKey, headers[consts.HeaderRequestIdKey]).
+	log.Debug().Str(consts.HeaderRequestIdKey, requestId).
 		Msgf("message claimed: {\n	body : %s, \n	headers : %+v, \n	timestamp : %v, \n	topic : %s\n}", string(msg.Value), headers, msg.Timestamp, msg.Topic)
 
 	body.Headers = headers
+	return requestId
+}
+
+// trackingHeaders are the tracking headers a record may carry in any letter case.
+var trackingHeaders = []string{
+	consts.HeaderRequestIdKey, consts.HeaderRequestTimeKey, consts.HeaderTraceIdKey, consts.HeaderClientId,
+}
+
+// normalizeTrackingHeaders stores every tracking header under its lowercase wire name, whatever case
+// the record used. When the record carries several spellings, the lowercase one wins, otherwise the
+// first in byte order; the others are removed.
+func normalizeTrackingHeaders(headers map[string]string) {
+	for _, name := range trackingHeaders {
+		var variants []string
+		for k := range headers {
+			if k != name && strings.EqualFold(k, name) {
+				variants = append(variants, k)
+			}
+		}
+		if len(variants) == 0 {
+			continue
+		}
+		slices.Sort(variants)
+		if _, ok := headers[name]; !ok {
+			headers[name] = headers[variants[0]]
+		}
+		for _, k := range variants {
+			delete(headers, k)
+		}
+	}
 }
 
 // IsBinaryData reports whether the string contains any non-printable byte.
@@ -86,8 +123,7 @@ func IsBinaryData(s string) bool {
 // PrepareConsumeMsg parses a consumed Kafka message into a ConsumerEvent with
 // normalised payload and tracking headers attached.
 func PrepareConsumeMsg(msg *sarama.ConsumerMessage, event *schemas.Event, body *schemas.RequestBody) *schemas.ConsumerEvent {
-	GetConsumeMsg(msg, body)
-	event.SetSuccess(body.Headers[consts.HeaderRequestIdKey])
+	event.SetSuccess(GetConsumeMsg(msg, body))
 
 	return &schemas.ConsumerEvent{
 		Values: &schemas.ContextValues{Body: body, RequestId: event.RequestId},

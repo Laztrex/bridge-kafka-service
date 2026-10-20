@@ -95,10 +95,13 @@ func TestNewUpstreamTLSSkipVerifyIsLoudlyWarned(t *testing.T) {
 	}
 }
 
+// httpService is a valid HTTP address, as config.Load fills it from defaults.
+var httpService = schemas.HostConfig{Name: "svc", Port: "8080", Path: "/predict"}
+
 func TestPrepareUpstreams(t *testing.T) {
 	b := testcerts.New(t, t.TempDir())
 
-	c := &schemas.ConsumerConfig{Topics: []string{"t"}}
+	c := &schemas.ConsumerConfig{Topics: []string{"t"}, Service: httpService}
 	if err := PrepareUpstreams(&schemas.KafkaInfo{Consumers: []*schemas.ConsumerConfig{c}}); err != nil || c.UpstreamTLS != nil {
 		t.Fatalf("defaults keep plaintext: %v %v", c.UpstreamTLS, err)
 	}
@@ -138,7 +141,9 @@ func TestPrepareUpstreamsFailurePolicy(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			cc := &schemas.ConsumerConfig{Topics: []string{"orders"}, OnFailure: c.policy, Service: schemas.HostConfig{MaxConn: c.maxConn}}
+			svc := httpService
+			svc.MaxConn = c.maxConn
+			cc := &schemas.ConsumerConfig{Topics: []string{"orders"}, OnFailure: c.policy, Service: svc}
 			err := PrepareUpstreams(&schemas.KafkaInfo{Consumers: []*schemas.ConsumerConfig{cc}})
 			if len(c.want) == 0 {
 				if err != nil {
@@ -155,8 +160,8 @@ func TestPrepareUpstreamsFailurePolicy(t *testing.T) {
 	}
 }
 
-// An active gRPC stanza needs a host:port target the gRPC client can parse; HTTP stanzas and
-// stanzas without topics are not checked.
+// An active gRPC stanza needs a host:port target the gRPC client can parse; an HTTP stanza is held to
+// the same host and port rule, and stanzas without topics are not checked.
 func TestPrepareUpstreamsGRPCTarget(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -173,12 +178,12 @@ func TestPrepareUpstreamsGRPCTarget(t *testing.T) {
 		{"port out of range", "grpc", "model-svc", "70000", []string{"orders"}, []string{`"70000"`}},
 		{"signed port", "grpc", "model-svc", "+80", []string{"orders"}, []string{`"+80"`}},
 		{"host with space", "grpc", "model svc", "50051", []string{"orders"}, []string{"service.name"}},
-		{"http not checked", "http", "svc", "abc", []string{"orders"}, nil},
+		{"http checked by the same rule", "http", "svc", "abc", []string{"orders"}, []string{"consumer #1", `"abc"`, "for http"}},
 		{"inactive not checked", "grpc", "", "", nil, nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			cc := &schemas.ConsumerConfig{Topics: c.topics, Service: schemas.HostConfig{Protocol: c.protocol, Name: c.host, Port: c.port}}
+			cc := &schemas.ConsumerConfig{Topics: c.topics, Service: schemas.HostConfig{Protocol: c.protocol, Name: c.host, Port: c.port, Path: "/"}}
 			err := PrepareUpstreams(&schemas.KafkaInfo{Consumers: []*schemas.ConsumerConfig{cc}})
 			if len(c.want) == 0 {
 				if err != nil {
@@ -218,7 +223,7 @@ func TestPrepareUpstreamsRetryResponseTopicMustBeProduced(t *testing.T) {
 				Topics:        []string{"orders"},
 				OnFailure:     c.policy,
 				ResponseTopic: c.responseTopic,
-				Service:       schemas.HostConfig{MaxConn: 2},
+				Service:       schemas.HostConfig{Name: "svc", Port: "8080", Path: "/predict", MaxConn: 2},
 			}
 			err := PrepareUpstreams(&schemas.KafkaInfo{Consumers: []*schemas.ConsumerConfig{cc}, Producers: c.producers})
 			if len(c.want) == 0 {
@@ -282,6 +287,58 @@ func TestNewKafkaTLS(t *testing.T) {
 	} {
 		if cfg := NewKafkaTLS(k); !cfg.InsecureSkipVerify || len(cfg.Certificates) != 0 {
 			t.Errorf("%s: must degrade to insecure, got %+v", name, cfg)
+		}
+	}
+}
+
+// An active HTTP stanza needs an address every call can use; nothing is resolved.
+func TestPrepareUpstreamsHTTPTarget(t *testing.T) {
+	cases := []struct {
+		name   string
+		svc    schemas.HostConfig
+		topics []string
+		want   []string
+	}{
+		{"valid", httpService, []string{"orders"}, nil},
+		{"unresolvable host is fine", schemas.HostConfig{Name: "model-svc.invalid", Port: "8080", Path: "/"}, []string{"orders"}, nil},
+		{"non-numeric port", schemas.HostConfig{Name: "svc", Port: "abc", Path: "/"}, []string{"orders"}, []string{"consumer #1", "orders", `"abc"`}},
+		{"zero port", schemas.HostConfig{Name: "svc", Port: "0", Path: "/"}, []string{"orders"}, []string{`"0"`}},
+		{"port out of range", schemas.HostConfig{Name: "svc", Port: "70000", Path: "/"}, []string{"orders"}, []string{`"70000"`}},
+		{"path without slash", schemas.HostConfig{Name: "svc", Port: "8080", Path: "predict"}, []string{"orders"}, []string{"consumer #1", `"predict"`, "service.path"}},
+		{"host with space", schemas.HostConfig{Name: "my svc", Port: "8080", Path: "/"}, []string{"orders"}, []string{"service.name"}},
+		{"bad URL", schemas.HostConfig{Name: "svc%zz", Port: "8080", Path: "/"}, []string{"orders"}, []string{"does not form an HTTP request"}},
+		{"inactive not checked", schemas.HostConfig{Port: "abc"}, nil, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := PrepareUpstreams(&schemas.KafkaInfo{Consumers: []*schemas.ConsumerConfig{{Topics: c.topics, Service: c.svc}}})
+			if len(c.want) == 0 {
+				if err != nil {
+					t.Fatalf("valid config rejected: %v", err)
+				}
+				return
+			}
+			for _, want := range c.want {
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %v must contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// Every problem of every stanza is reported together.
+func TestPrepareUpstreamsReportsEveryProblem(t *testing.T) {
+	bad := &schemas.ConsumerConfig{Topics: []string{"orders"}, Service: schemas.HostConfig{
+		Name: "svc", Port: "abc", Path: "/", TLS: schemas.ServiceTLS{Mode: "mtls", CertPath: "/c.pem"},
+	}}
+	other := &schemas.ConsumerConfig{Topics: []string{"payments"}, OnFailure: "park", Service: httpService}
+
+	err := PrepareUpstreams(&schemas.KafkaInfo{Consumers: []*schemas.ConsumerConfig{bad, other}})
+
+	for _, want := range []string{`service.port "abc"`, "missing key_path", "consumer #2", `"park"`} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %v must contain %q", err, want)
 		}
 	}
 }

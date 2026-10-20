@@ -14,6 +14,10 @@ import (
 	"bridge-kafka-service/internal/schemas"
 )
 
+// httpMaxResponseBytes caps the response body read from an HTTP upstream, the same limit the gRPC
+// client applies, so a misbehaving service cannot make the process allocate without bound.
+const httpMaxResponseBytes = grpcMaxMessageBytes
+
 type httpUpstream struct {
 	uri    string
 	client *http.Client
@@ -43,10 +47,7 @@ func (u *httpUpstream) Call(ctx context.Context, req UpstreamRequest) (UpstreamR
 	if err != nil {
 		return UpstreamResponse{}, fmt.Errorf("failed create request: %w", err)
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	for k, v := range req.Headers {
-		httpReq.Header.Set(k, v)
-	}
+	setRecordHeaders(httpReq.Header, req.Headers)
 
 	resp, err := u.client.Do(httpReq)
 	if err != nil {
@@ -57,9 +58,12 @@ func (u *httpUpstream) Call(ctx context.Context, req UpstreamRequest) (UpstreamR
 	log.Info().Str(consts.HeaderRequestIdKey, req.Headers[consts.HeaderRequestIdKey]).
 		Msgf("response received: status %d", resp.StatusCode)
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, httpMaxResponseBytes+1))
 	if err != nil {
 		return UpstreamResponse{}, fmt.Errorf("failed to read response body: %w", err)
+	}
+	if len(body) > httpMaxResponseBytes {
+		return UpstreamResponse{}, permanentError{fmt.Errorf("response body of %s exceeds %d bytes", u.uri, httpMaxResponseBytes)}
 	}
 	return UpstreamResponse{Body: body, Header: resp.Header}, nil
 }

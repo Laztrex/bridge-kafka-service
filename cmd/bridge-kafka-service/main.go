@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/rs/zerolog/log"
@@ -35,6 +36,7 @@ var (
 type options struct {
 	configPath  string
 	showVersion bool
+	checkConfig bool
 }
 
 func main() {
@@ -51,6 +53,7 @@ func parseFlags(args []string, stderr io.Writer) (options, int) {
 	fs.StringVar(&opts.configPath, "c", "", "shorthand for -config")
 	fs.BoolVar(&opts.showVersion, "version", false, "print the version and exit")
 	fs.BoolVar(&opts.showVersion, "v", false, "shorthand for -version")
+	fs.BoolVar(&opts.checkConfig, "check-config", false, "check the configuration and exit: 0 if it is valid, 1 otherwise")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return opts, 0
@@ -72,6 +75,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if opts.showVersion {
 		_, _ = fmt.Fprintln(stdout, versionLine())
 		return 0
+	}
+	if opts.checkConfig {
+		return checkConfig(opts.configPath, stdout, stderr)
 	}
 
 	logging.Init(config.LogFilePath(os.Getenv))
@@ -104,5 +110,35 @@ func run(args []string, stdout, stderr io.Writer) int {
 		log.Error().Err(err).Msg("service stopped with error")
 		return 1
 	}
+	return 0
+}
+
+// checkConfig loads the configuration and runs exactly the checks startup runs, without setting up
+// logging, connecting anywhere or writing files. Warnings and errors go to stderr, one per line,
+// and the verdict to stdout; it returns 0 when the configuration is valid and 1 otherwise.
+func checkConfig(flagPath string, stdout, stderr io.Writer) int {
+	path, usedDefault := config.ResolvePath(flagPath, os.Getenv)
+	if usedDefault {
+		_, _ = fmt.Fprintf(stderr, "warning: config file is not specified, using default %s\n", path)
+	}
+	cfg, err := config.Load(path, os.Getenv)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	for _, key := range cfg.Warnings {
+		_, _ = fmt.Fprintf(stderr, "warning: unknown config key %q is ignored\n", key)
+	}
+	warnings, err := app.Check(cfg)
+	for _, w := range warnings {
+		_, _ = fmt.Fprintf(stderr, "warning: %s\n", w)
+	}
+	if err != nil {
+		for _, line := range strings.Split(err.Error(), "\n") {
+			_, _ = fmt.Fprintf(stderr, "error: %s\n", line)
+		}
+		return 1
+	}
+	_, _ = fmt.Fprintf(stdout, "configuration %s is valid\n", path)
 	return 0
 }

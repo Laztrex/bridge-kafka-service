@@ -36,29 +36,68 @@ func TestValidate(t *testing.T) {
 	}
 }
 
-// Consumer groups need Kafka 0.10.2; only a parseable older version with active consumers is fatal.
+// An empty consumer entry is an error, not a crash and not a disabled stanza; every problem is
+// reported in one error.
+func TestValidateReportsEveryProblem(t *testing.T) {
+	disabled := &schemas.ConsumerConfig{Group: "g", Service: schemas.HostConfig{Name: "svc"}}
+	active := &schemas.ConsumerConfig{Topics: []string{"t"}, Service: schemas.HostConfig{Name: "svc"}}
+
+	err := Validate(&schemas.KafkaInfo{Brokers: []string{"b"}, Version: "2.x", Consumers: []*schemas.ConsumerConfig{active, nil, disabled}})
+
+	for _, want := range []string{"consumer #2 is empty", "no Kafka consumer group defined for consumer #1", `kafka.version "2.x"`} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %v must contain %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "consumer #3") {
+		t.Fatalf("a stanza without topics is disabled, not an error: %v", err)
+	}
+}
+
+// An empty producer entry is an error too, not a crash.
+func TestValidateEmptyProducer(t *testing.T) {
+	err := Validate(&schemas.KafkaInfo{Brokers: []string{"b"}, Producers: []*schemas.ProducerConfig{{Topic: "out"}, nil}})
+
+	if err == nil || !strings.Contains(err.Error(), "producer #2 is empty") {
+		t.Fatalf("error %v must name producer #2", err)
+	}
+}
+
+// Consumer groups need Kafka 0.10.2 and record headers 0.11; a non-empty version must parse, an
+// empty one keeps the client default.
 func TestValidateKafkaVersion(t *testing.T) {
 	consumer := &schemas.ConsumerConfig{Topics: []string{"t"}, Group: "g", Service: schemas.HostConfig{Name: "svc"}}
 	producer := &schemas.ProducerConfig{Topic: "o"}
+	consumers := []*schemas.ConsumerConfig{consumer}
+	producers := []*schemas.ProducerConfig{producer}
 	cases := []struct {
 		name    string
 		cfg     *schemas.KafkaInfo
-		wantErr bool
+		wantErr []string
 	}{
-		{"too old", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "0.10.1.0", Consumers: []*schemas.ConsumerConfig{consumer}}, true},
-		{"too old with producer", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "0.10.1.0", Consumers: []*schemas.ConsumerConfig{consumer}, Producers: []*schemas.ProducerConfig{producer}}, true},
-		{"minimum", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "0.10.2.0", Consumers: []*schemas.ConsumerConfig{consumer}}, false},
-		{"unparseable keeps fallback", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "latest", Consumers: []*schemas.ConsumerConfig{consumer}}, false},
-		{"producer only", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "0.10.1.0", Producers: []*schemas.ProducerConfig{producer}}, false},
+		{"too old for groups", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "0.10.1.0", Consumers: consumers}, []string{`"0.10.1.0"`, "0.10.2"}},
+		{"too old for groups, with producer", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "0.10.1.0", Consumers: consumers, Producers: producers}, []string{`"0.10.1.0"`, "0.10.2"}},
+		{"group minimum, consumers only", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "0.10.2.0", Consumers: consumers}, nil},
+		{"too old for headers", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "0.10.2.0", Consumers: consumers, Producers: producers}, []string{`"0.10.2.0"`, "0.11"}},
+		{"too old for headers, producer only", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "0.10.1.0", Producers: producers}, []string{`"0.10.1.0"`, "0.11"}},
+		{"header minimum", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "0.11.0.0", Consumers: consumers, Producers: producers}, nil},
+		{"unparseable stops startup", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "latest", Consumers: consumers, Producers: producers}, []string{`"latest"`, "not a Kafka version"}},
+		{"unparseable without consumers or producers checks", &schemas.KafkaInfo{Brokers: []string{"b"}, Version: "2.x", Producers: producers}, []string{`"2.x"`}},
+		{"empty keeps the default", &schemas.KafkaInfo{Brokers: []string{"b"}, Consumers: consumers, Producers: producers}, nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			err := Validate(c.cfg)
-			if (err != nil) != c.wantErr {
-				t.Fatalf("Validate() = %v, wantErr %v", err, c.wantErr)
+			if len(c.wantErr) == 0 {
+				if err != nil {
+					t.Fatalf("valid config rejected: %v", err)
+				}
+				return
 			}
-			if err != nil && (!strings.Contains(err.Error(), `"0.10.1.0"`) || !strings.Contains(err.Error(), "0.10.2")) {
-				t.Fatalf("error %v must name the version and the minimum", err)
+			for _, want := range c.wantErr {
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %v must contain %q", err, want)
+				}
 			}
 		})
 	}
@@ -428,4 +467,27 @@ func mustLoad(t *testing.T, yaml string, vars map[string]string) *Config {
 		t.Fatalf("Load: %v", err)
 	}
 	return cfg
+}
+
+// Backup retention: 0 by default (keep everything), whole numbers from YAML or strings, anything
+// else stops loading with the key and the value.
+func TestRetention(t *testing.T) {
+	if got := mustLoad(t, "", nil).Retention; got != (Retention{}) {
+		t.Fatalf("defaults: %+v", got)
+	}
+	cfg := mustLoad(t, "retention:\n  max_backups: 10\n  max_age_days: \"30\"\n", nil)
+	if cfg.Retention != (Retention{MaxBackups: 10, MaxAgeDays: 30}) {
+		t.Fatalf("parsed: %+v", cfg.Retention)
+	}
+	for _, w := range cfg.Warnings {
+		if strings.HasPrefix(w, "retention") {
+			t.Fatalf("retention keys must be known, got warning %q", w)
+		}
+	}
+	for _, bad := range []string{"-1", "month"} {
+		_, err := Load(writeFile(t, t.TempDir(), "app.yaml", "retention:\n  max_age_days: "+bad+"\n"), env(nil))
+		if err == nil || !strings.Contains(err.Error(), "retention.max_age_days") || !strings.Contains(err.Error(), bad) {
+			t.Fatalf("value %q: error %v must name the key and the value", bad, err)
+		}
+	}
 }

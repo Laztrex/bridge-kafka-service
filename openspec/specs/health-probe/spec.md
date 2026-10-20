@@ -42,12 +42,54 @@ The endpoint MUST NOT require any authentication header or token; orchestration 
 - **THEN** the endpoint replies successfully anyway
 
 ### Requirement: Liveness alias and readiness probe
-The listener MUST also serve `GET /healthz` with the same liveness semantics and response as `GET /health` (which stays for existing probes). It MUST serve `GET /readyz`, answering 200 `{"status":"ready"}` only when the shared producer is connected (if any producer is configured) and every configured consumer client is running, and 503 `{"status":"not ready","reasons":[...]}` otherwise. `GET /status` MUST return the readiness details as JSON (`ready`, `reasons`, `producer_ready`, `consumers_up`, `consumers_total`) with status 200.
+
+The listener MUST also serve `GET /healthz` with the same liveness semantics and response as `GET /health` (which stays for existing probes). It MUST serve `GET /readyz`, answering 200 `{"status":"ready"}` only when the shared producer is connected (if any producer is configured) and the consumer client of every active consumer stanza (a stanza with topics) is running, and 503 `{"status":"not ready","reasons":[...]}` otherwise. `GET /status` MUST return the readiness details as JSON (`ready`, `reasons`, `producer_ready`, `consumers_up`, `consumers_total`) with status 200; `consumers_total` MUST count active consumer stanzas only.
 
 #### Scenario: Kafka not connected yet
+
 - **WHEN** the service has started but the producer is not connected
 - **THEN** `GET /healthz` and `GET /health` answer 200 and `GET /readyz` answers 503 naming the producer
 
 #### Scenario: Everything connected
+
 - **WHEN** the producer is connected and every consumer client is running
 - **THEN** `GET /readyz` answers 200
+
+#### Scenario: Disabled stanza
+
+- **WHEN** the configuration has two consumer stanzas with topics and one without, and both active consumer clients are running
+- **THEN** `GET /readyz` answers 200 and `GET /status` reports `consumers_total: 2`
+
+### Requirement: Pipeline retry state in status
+
+`GET /status` MUST include `pipelines`: one entry per active consumer stanza, in configuration order, with `group`, `topics`, `retrying_calls` (records retrying the upstream call), `retrying_publications` (responses retrying their write), `oldest_retry_seconds` (age of the oldest of those since its first failed attempt, `0` when none), `uncommitted` (records handed out by current claims and not yet committed) and `paused` (whether consumption is paused by `SIGUSR1`). Readiness MUST NOT depend on these values.
+
+#### Scenario: Healthy pipeline
+
+- **WHEN** a pipeline processes records and none of them fails
+- **THEN** its `pipelines` entry reports `retrying_calls: 0`, `retrying_publications: 0` and `oldest_retry_seconds: 0`
+
+#### Scenario: Record stuck in retry
+
+- **WHEN** a `retry` pipeline with `max_conn: 1` has been retrying one record for 3 minutes while the upstream is unreachable
+- **THEN** its entry reports `retrying_calls: 1` and an `oldest_retry_seconds` of about 180, and `GET /readyz` is unaffected
+
+#### Scenario: Records held behind a retry
+
+- **WHEN** a fast-mode pipeline keeps retrying one record while 40 later records of the same partition finish
+- **THEN** its entry reports `uncommitted` of at least 41
+
+#### Scenario: Publication retry
+
+- **WHEN** a `retry` stanza's response topic rejects writes and two responses are waiting for their next attempt
+- **THEN** its entry reports `retrying_publications: 2`
+
+#### Scenario: Disabled stanza
+
+- **WHEN** the configuration has a stanza without topics
+- **THEN** `pipelines` has no entry for it
+
+#### Scenario: Paused process
+
+- **WHEN** one `SIGUSR1` has paused consumption
+- **THEN** every `pipelines` entry reports `paused: true`, `GET /readyz` is unaffected, and after the next `SIGUSR1` every entry reports `paused: false`

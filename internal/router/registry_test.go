@@ -26,18 +26,3 @@ func TestProducerRegistry(t *testing.T) {
 	assert.False(t, ok, "topic list is an allow-list")
 	assert.Len(t, reg.Producers(), 2)
 }
-
-func TestToggleConsumptionFlow(t *testing.T) {
-	g := mocksarama.NewFakeConsumerGroup(mocksarama.NewFakeClient())
-	paused := false
-
-	toggleConsumptionFlow(g, &paused)
-	assert.True(t, paused)
-	assert.Equal(t, 1, g.PauseCount())
-
-	toggleConsumptionFlow(g, &paused)
-	assert.False(t, paused)
-	assert.Equal(t, 1, g.ResumeCount())
-
-	toggleConsumptionFlow(nil, &paused)
-}

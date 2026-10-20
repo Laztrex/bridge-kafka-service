@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"bridge-kafka-service/internal/router"
 	"bridge-kafka-service/internal/schemas"
@@ -78,6 +80,95 @@ func TestIsLoopback(t *testing.T) {
 	for host, want := range map[string]bool{"127.0.0.1": true, "::1": true, "localhost": true, "0.0.0.0": false, "": false, "10.0.0.1": false} {
 		if got := isLoopback(host); got != want {
 			t.Errorf("isLoopback(%q) = %v, want %v", host, got, want)
+		}
+	}
+}
+
+// A stanza without topics is disabled: it does not count towards readiness.
+func TestReadinessCountsOnlyActiveStanzas(t *testing.T) {
+	cfg := &schemas.KafkaInfo{Consumers: []*schemas.ConsumerConfig{
+		{Topics: []string{"a"}}, {Topics: []string{"b"}}, {Topics: nil}, nil,
+	}}
+	r := newReadiness(router.NewProducerRegistry(), cfg)
+	if r.consumersTotal != 2 {
+		t.Fatalf("consumers_total = %d, want 2", r.consumersTotal)
+	}
+	r.consumerUp()
+	r.consumerUp()
+	if reasons := r.reasons(); len(reasons) != 0 {
+		t.Fatalf("both active stanzas are up, got reasons %v", reasons)
+	}
+}
+
+func status(t *testing.T, r *readiness) statusResponse {
+	t.Helper()
+	w := httptest.NewRecorder()
+	r.serveStatus(w, httptest.NewRequest(http.MethodGet, "/status", nil))
+	var st statusResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &st); err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+// /status lists every active pipeline with its retry state; a disabled stanza has no entry.
+func TestStatus_PipelinesOfActiveStanzas(t *testing.T) {
+	cfg := &schemas.KafkaInfo{Consumers: []*schemas.ConsumerConfig{
+		{Topics: []string{"a"}, Group: "g1"}, {Topics: nil, Group: "off"}, {Topics: []string{"b", "c"}, Group: "g2"},
+	}}
+	r := newReadiness(router.NewProducerRegistry(), cfg)
+
+	st := status(t, r)
+
+	want := []pipelineStatus{{Group: "g1", Topics: []string{"a"}}, {Group: "g2", Topics: []string{"b", "c"}}}
+	if !reflect.DeepEqual(st.Pipelines, want) {
+		t.Fatalf("pipelines = %+v, want %+v", st.Pipelines, want)
+	}
+}
+
+// A record stuck in retry shows in /status, and readiness does not change because of it.
+func TestStatus_StuckRetryDoesNotAffectReadiness(t *testing.T) {
+	cfg := &schemas.KafkaInfo{Consumers: []*schemas.ConsumerConfig{{Topics: []string{"a"}, Group: "g"}}}
+	r := newReadiness(router.NewProducerRegistry(), cfg)
+	r.consumerUp()
+	state := r.pipelines[0].state
+	state.CallRetrying(&schemas.ConsumerEvent{}, time.Now().Add(-3*time.Minute))
+	state.PublicationRetrying(&schemas.ConsumerEvent{}, time.Now().Add(-time.Minute))
+	state.AddUncommitted(41)
+
+	st := status(t, r)
+
+	got := st.Pipelines[0]
+	if got.RetryingCalls != 1 || got.RetryingPublications != 1 || got.Uncommitted != 41 {
+		t.Fatalf("pipeline = %+v", got)
+	}
+	if got.OldestRetrySeconds < 179 || got.OldestRetrySeconds > 181 {
+		t.Fatalf("oldest_retry_seconds = %d, want about 180", got.OldestRetrySeconds)
+	}
+	if !st.Ready || len(r.reasons()) != 0 {
+		t.Fatalf("a retry must not affect readiness: %+v", st)
+	}
+}
+
+// /status reports the process-wide pause in every pipeline entry; readiness ignores it.
+func TestStatus_ReportsPause(t *testing.T) {
+	cfg := &schemas.KafkaInfo{Consumers: []*schemas.ConsumerConfig{{Topics: []string{"a"}, Group: "g1"}, {Topics: []string{"b"}, Group: "g2"}}}
+	r := newReadiness(router.NewProducerRegistry(), cfg)
+	r.consumerUp()
+	r.consumerUp()
+
+	for i, want := range []bool{false, true, false} {
+		if i > 0 {
+			r.pause.Toggle()
+		}
+		st := status(t, r)
+		for _, p := range st.Pipelines {
+			if p.Paused != want {
+				t.Fatalf("after %d toggles: pipeline %s paused=%v, want %v", i, p.Group, p.Paused, want)
+			}
+		}
+		if !st.Ready || len(r.reasons()) != 0 {
+			t.Fatalf("a pause must not affect readiness: %+v", st)
 		}
 	}
 }

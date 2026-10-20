@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
@@ -16,6 +17,8 @@ import (
 	"time"
 
 	"github.com/IBM/sarama"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -264,7 +267,7 @@ func subscriptionFailureSeams(t *testing.T, run func(context.Context) error) {
 	newConsumerClientWithRetry = func(context.Context, *schemas.KafkaInfo, *schemas.ConsumerConfig, *router.Tuning) (sarama.Client, error) {
 		return mocksarama.NewFakeClient(), nil
 	}
-	runSubscription = func(parent context.Context, _ <-chan struct{}, _ sarama.Client, _ *schemas.ConsumerConfig, _ chan<- *schemas.ConsumerEvent, _ *observability.FileTransactionLogger) error {
+	runSubscription = func(parent context.Context, _ *router.Pause, _ sarama.Client, _ *schemas.ConsumerConfig, _ chan<- *schemas.ConsumerEvent, _ *observability.FileTransactionLogger, _ *transport.PipelineState) error {
 		return run(parent)
 	}
 	t.Cleanup(func() { newConsumerClientWithRetry, runSubscription = oldClient, oldRun })
@@ -345,21 +348,25 @@ func TestConnect_EachResponseTopicStanzaGetsItsOwnPublisher(t *testing.T) {
 
 	var mu sync.Mutex
 	queueOf := map[string]chan<- *schemas.ConsumerEvent{}
+	subscriptionState := map[string]*transport.PipelineState{}
 	var subscribed sync.WaitGroup
 	subscribed.Add(3)
-	runSubscription = func(parent context.Context, _ <-chan struct{}, _ sarama.Client, conf *schemas.ConsumerConfig, queue chan<- *schemas.ConsumerEvent, _ *observability.FileTransactionLogger) error {
+	runSubscription = func(parent context.Context, _ *router.Pause, _ sarama.Client, conf *schemas.ConsumerConfig, queue chan<- *schemas.ConsumerEvent, _ *observability.FileTransactionLogger, state *transport.PipelineState) error {
 		mu.Lock()
 		queueOf[conf.Topics[0]] = queue
+		subscriptionState[conf.Topics[0]] = state
 		mu.Unlock()
 		subscribed.Done()
 		<-parent.Done()
 		return nil
 	}
 	var workers []int
+	var publisherStates []*transport.PipelineState
 	var drained atomic.Int32
-	responsePublish = func(ctx context.Context, _ <-chan *schemas.ConsumerEvent, n int, _ schemas.TransactionLogger, _ handlers.ProducerLookup) {
+	responsePublish = func(ctx context.Context, _ <-chan *schemas.ConsumerEvent, n int, _ schemas.TransactionLogger, _ handlers.ProducerLookup, state *transport.PipelineState) {
 		mu.Lock()
 		workers = append(workers, n)
+		publisherStates = append(publisherStates, state)
 		mu.Unlock()
 		<-ctx.Done()
 		time.Sleep(50 * time.Millisecond)
@@ -385,7 +392,16 @@ func TestConnect_EachResponseTopicStanzaGetsItsOwnPublisher(t *testing.T) {
 	go func() { done <- Connect(ctx, wrap(cfg)) }()
 
 	subscribed.Wait()
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(workers) == 2
+	}, 5*time.Second, 5*time.Millisecond, "both publisher sets start")
 	mu.Lock()
+	assert.NotNil(t, subscriptionState["a"])
+	assert.NotSame(t, subscriptionState["a"], subscriptionState["b"], "each pipeline has its own state")
+	assert.ElementsMatch(t, []*transport.PipelineState{subscriptionState["a"], subscriptionState["b"]}, publisherStates,
+		"a pipeline's publishers report into the same state as its subscription")
 	assert.NotNil(t, queueOf["a"])
 	assert.NotNil(t, queueOf["b"])
 	assert.True(t, queueOf["a"] != queueOf["b"], "each pipeline has its own queue")
@@ -477,6 +493,74 @@ func TestConnect_UnknownRebalanceStrategyStopsStartup(t *testing.T) {
 	assert.ErrorContains(t, err, `"fair"`)
 }
 
+// A stanza without topics gets no Kafka client and no subscription, is named once in the log,
+// and is not counted in /status.
+func TestConnect_StanzaWithoutTopicsIsDisabled(t *testing.T) {
+	wrap := connectEnv(t, time.Minute)
+	logs := &syncLog{}
+	oldLogger := log.Logger
+	log.Logger = zerolog.New(logs)
+	t.Cleanup(func() { log.Logger = oldLogger })
+
+	var clients atomic.Int32
+	started := make(chan struct{}, 2)
+	oldClient, oldRun := newConsumerClientWithRetry, runSubscription
+	newConsumerClientWithRetry = func(context.Context, *schemas.KafkaInfo, *schemas.ConsumerConfig, *router.Tuning) (sarama.Client, error) {
+		clients.Add(1)
+		return mocksarama.NewFakeClient(), nil
+	}
+	runSubscription = func(parent context.Context, _ *router.Pause, _ sarama.Client, _ *schemas.ConsumerConfig, _ chan<- *schemas.ConsumerEvent, _ *observability.FileTransactionLogger, _ *transport.PipelineState) error {
+		started <- struct{}{}
+		<-parent.Done()
+		return nil
+	}
+	t.Cleanup(func() { newConsumerClientWithRetry, runSubscription = oldClient, oldRun })
+
+	cfg := &schemas.KafkaInfo{
+		Brokers: []string{freeAddr(t)},
+		Version: "2.3.0",
+		Consumers: []*schemas.ConsumerConfig{
+			{Topics: []string{"orders"}, Group: "g", ClientId: "c", Service: schemas.HostConfig{Name: "svc", Port: "1", Path: "/"}},
+			{Group: "g", ClientId: "c", Service: schemas.HostConfig{Name: "svc", Port: "1", Path: "/"}},
+		},
+	}
+	appCfg := wrap(cfg)
+	appCfg.HTTPAddr = freeAddr(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Connect(ctx, appCfg) }()
+
+	select {
+	case <-started:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the active stanza did not start")
+	}
+	assert.Contains(t, pollStatus(t, appCfg.HTTPAddr), `"consumers_total":1`)
+	cancel()
+	require.NoError(t, <-done)
+
+	assert.Equal(t, int32(1), clients.Load(), "only the active stanza gets a Kafka client")
+	assert.Contains(t, logs.String(), "consumer #2 has no topics: disabled")
+	assert.NotContains(t, logs.String(), "no topics provided")
+}
+
+type syncLog struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *syncLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *syncLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
 func TestConnect_GracefulShutdownOnContextCancel(t *testing.T) {
 	wrap := connectEnv(t, 5*time.Minute)
 	cfg := &schemas.KafkaInfo{
@@ -566,7 +650,7 @@ func failingProducerSeams(t *testing.T, delay time.Duration) *atomic.Int32 {
 
 	var runs atomic.Int32
 	oldRun := runSubscription
-	runSubscription = func(parent context.Context, _ <-chan struct{}, _ sarama.Client, _ *schemas.ConsumerConfig, _ chan<- *schemas.ConsumerEvent, _ *observability.FileTransactionLogger) error {
+	runSubscription = func(parent context.Context, _ *router.Pause, _ sarama.Client, _ *schemas.ConsumerConfig, _ chan<- *schemas.ConsumerEvent, _ *observability.FileTransactionLogger, _ *transport.PipelineState) error {
 		runs.Add(1)
 		<-parent.Done()
 		return nil
@@ -657,7 +741,9 @@ func TestConnect_ProducerFailureGatesConsumersWithResponseTopics(t *testing.T) {
 	assert.Zero(t, runs.Load(), "a stanza with response_topic must never subscribe after a producer failure")
 }
 
-func TestConnect_ProducerFailureIsNotFatalWithoutResponseTopics(t *testing.T) {
+// A producer that cannot be created is fatal even when no stanza has a response_topic: the process
+// exits instead of consuming while never ready, and no subscription starts first.
+func TestConnect_ProducerFailureIsFatalWithoutResponseTopics(t *testing.T) {
 	wrap := connectEnv(t, time.Minute)
 	runs := failingProducerSeams(t, 0)
 	cfg := &schemas.KafkaInfo{
@@ -670,23 +756,196 @@ func TestConnect_ProducerFailureIsNotFatalWithoutResponseTopics(t *testing.T) {
 		}},
 	}
 
+	done := make(chan error, 1)
+	go func() { done <- Connect(context.Background(), wrap(cfg)) }()
+
+	select {
+	case err := <-done:
+		assert.ErrorContains(t, err, "permanently failed to create producer")
+	case <-time.After(15 * time.Second):
+		t.Fatal("Connect kept running after the producer failed permanently")
+	}
+	assert.Zero(t, runs.Load(), "no stanza subscribes after a producer failure")
+}
+
+// Every subscription follows one process-wide pause, which /status reports per pipeline.
+func TestConnect_SubscriptionsShareOnePause(t *testing.T) {
+	wrap := connectEnv(t, time.Minute)
+	oldClient, oldRun := newConsumerClientWithRetry, runSubscription
+	t.Cleanup(func() { newConsumerClientWithRetry, runSubscription = oldClient, oldRun })
+	newConsumerClientWithRetry = func(context.Context, *schemas.KafkaInfo, *schemas.ConsumerConfig, *router.Tuning) (sarama.Client, error) {
+		return mocksarama.NewFakeClient(), nil
+	}
+	var mu sync.Mutex
+	var pauses []*router.Pause
+	var subscribed sync.WaitGroup
+	subscribed.Add(2)
+	runSubscription = func(parent context.Context, pause *router.Pause, _ sarama.Client, _ *schemas.ConsumerConfig, _ chan<- *schemas.ConsumerEvent, _ *observability.FileTransactionLogger, _ *transport.PipelineState) error {
+		mu.Lock()
+		pauses = append(pauses, pause)
+		mu.Unlock()
+		subscribed.Done()
+		<-parent.Done()
+		return nil
+	}
+	svc := schemas.HostConfig{Name: "svc", Port: "1", Path: "/"}
+	cfg := &schemas.KafkaInfo{Brokers: []string{freeAddr(t)}, Version: "2.3.0", Consumers: []*schemas.ConsumerConfig{
+		{Topics: []string{"a"}, Group: "g1", ClientId: "c", Service: svc},
+		{Topics: []string{"b"}, Group: "g2", ClientId: "c", Service: svc},
+	}}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- Connect(ctx, wrap(cfg)) }()
+	subscribed.Wait()
 
-	time.Sleep(300 * time.Millisecond)
-	select {
-	case err := <-done:
-		t.Fatalf("Connect must keep running after a producer failure when no stanza has a response_topic, got %v", err)
-	default:
-	}
-	require.Equal(t, int32(1), runs.Load(), "a stanza without response_topic starts reading as before")
+	mu.Lock()
+	require.Len(t, pauses, 2)
+	assert.NotNil(t, pauses[0])
+	assert.Same(t, pauses[0], pauses[1], "both subscriptions follow the same pause")
+	mu.Unlock()
 
 	cancel()
-	select {
-	case err := <-done:
-		assert.NoError(t, err)
-	case <-time.After(15 * time.Second):
-		t.Fatal("Connect did not shut down after cancellation")
+	assert.NoError(t, <-done)
+}
+
+// One run reports every problem, from every part of the check, and Connect stops on it before
+// opening the metric file.
+func TestCheck_ReportsProblemsOfEveryPart(t *testing.T) {
+	wrap := connectEnv(t, time.Minute)
+	tuningDir(t, map[string]string{})
+	cfg := &schemas.KafkaInfo{
+		Brokers: []string{"127.0.0.1:1"},
+		Version: "2.x",
+		Consumers: []*schemas.ConsumerConfig{{
+			Topics: []string{"orders"}, Group: "g", ResponseTopic: "orders",
+			Service: schemas.HostConfig{Name: "svc", Port: "abc", Path: "/"},
+		}},
 	}
+
+	warnings, err := Check(wrap(cfg))
+
+	require.Error(t, err)
+	assert.Empty(t, warnings)
+	for _, want := range []string{`kafka.version "2.x"`, `service.port "abc"`, "orders -> orders", "invalid Kafka consumer tuning"} {
+		assert.ErrorContains(t, err, want)
+	}
+
+	app := wrap(cfg)
+	require.Error(t, Connect(context.Background(), app))
+	_, statErr := os.Stat(app.MetricFilePath())
+	assert.True(t, os.IsNotExist(statErr), "startup stops before the metric file is opened")
+}
+
+func TestCheck_ValidConfigurationReturnsTopologyWarnings(t *testing.T) {
+	wrap := connectEnv(t, time.Minute)
+	tuningDir(t, map[string]string{"config_consumer.yaml": "consumer:\n  return:\n    errors: true\n"})
+	svc := schemas.HostConfig{Name: "svc", Port: "8080", Path: "/"}
+	cfg := &schemas.KafkaInfo{
+		Brokers: []string{"127.0.0.1:1"},
+		Consumers: []*schemas.ConsumerConfig{
+			{Topics: []string{"orders"}, Group: "g", Service: svc},
+			{Topics: []string{"payments"}, Group: "g", Service: svc},
+		},
+	}
+
+	warnings, err := Check(wrap(cfg))
+
+	require.NoError(t, err)
+	require.Len(t, warnings, 1)
+	assert.Contains(t, warnings[0], "rebalance together")
+}
+
+// The retention line is logged once when a limit is set, and not at all with the defaults.
+func TestLogRetention(t *testing.T) {
+	logs := &syncLog{}
+	old := log.Logger
+	log.Logger = zerolog.New(logs)
+	t.Cleanup(func() { log.Logger = old })
+
+	logRetention(config.Retention{})
+	assert.NotContains(t, logs.String(), "backups are pruned", "nothing is logged without limits")
+
+	logRetention(config.Retention{MaxBackups: 10, MaxAgeDays: 30})
+	assert.Contains(t, logs.String(), "at most 10 backups")
+	assert.Contains(t, logs.String(), "younger than 30 days")
+	assert.Contains(t, logs.String(), "older audit backups are deleted")
+
+	logRetention(config.Retention{MaxAgeDays: 7})
+	assert.Contains(t, logs.String(), "no count limit")
+}
+
+// slowProducer takes delay for every send and counts them.
+type slowProducer struct {
+	sarama.SyncProducer
+	delay time.Duration
+	sends atomic.Int32
+}
+
+func (p *slowProducer) SendMessage(*sarama.ProducerMessage) (int32, int64, error) {
+	p.sends.Add(1)
+	time.Sleep(p.delay)
+	return 0, 0, nil
+}
+
+// serveListener starts the public listener with a producer for topic "out" and returns its address.
+func serveListener(t *testing.T, producer sarama.SyncProducer) string {
+	t.Helper()
+	reg := router.NewProducerRegistry()
+	reg.Set(producer, []string{"out"})
+	srv := server(t, &schemas.KafkaInfo{Producers: []*schemas.ProducerConfig{{Topic: "out"}}}, reg)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = srv.Serve(l) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return l.Addr().String()
+}
+
+func TestHTTPServer_Timeouts(t *testing.T) {
+	srv := server(t, &schemas.KafkaInfo{}, router.NewProducerRegistry())
+
+	assert.Equal(t, 10*time.Second, srv.ReadHeaderTimeout)
+	assert.Equal(t, 30*time.Second, srv.ReadTimeout)
+	assert.Equal(t, 120*time.Second, srv.IdleTimeout)
+	assert.Zero(t, srv.WriteTimeout, "a slow publish must not be cut off")
+}
+
+func TestHTTPServer_StalledBodyIsClosedAndNothingPublished(t *testing.T) {
+	old := httpReadTimeout
+	httpReadTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { httpReadTimeout = old })
+	producer := &slowProducer{}
+	addr := serveListener(t, producer)
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = conn.Write([]byte("POST /api/" + consts.ControllerVersionAPI + "/publish HTTP/1.1\r\nHost: x\r\n" +
+		consts.HeaderProduceTopicName + ": out\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"a\":"))
+	require.NoError(t, err)
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	began := time.Now()
+	_, _ = bufio.NewReader(conn).ReadString('\n') // returns when the server gives up on the body
+	assert.Less(t, time.Since(began), 2*time.Second, "the stalled request is closed after the read timeout")
+	assert.Zero(t, producer.sends.Load(), "nothing is published from an incomplete body")
+}
+
+func TestHTTPServer_SlowPublishStillAnswers(t *testing.T) {
+	old := httpReadTimeout
+	httpReadTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { httpReadTimeout = old })
+	producer := &slowProducer{delay: 500 * time.Millisecond}
+	addr := serveListener(t, producer)
+
+	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/api/"+consts.ControllerVersionAPI+"/publish", strings.NewReader(`{"a":1}`))
+	require.NoError(t, err)
+	req.Header.Set(consts.HeaderProduceTopicName, "out")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "the publish result reaches the client after the read timeout")
+	assert.Equal(t, int32(1), producer.sends.Load())
 }

@@ -1,6 +1,9 @@
 package consts
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Server defaults, config file locations and the default paths of the run and metrics logs.
 const (
@@ -31,6 +34,21 @@ const (
 	HeaderTraceIdKey     = "x-trace-id"
 	HeaderClientId       = "x-client-id"
 )
+
+// RequiredHeaders lists the headers a consumed record and a publish request must carry. It is empty
+// for now; the tracking headers above are the candidates. A listed header gets no default value.
+// Only tests modify it.
+var RequiredHeaders = []string{}
+
+// IsRequiredHeader reports whether name is listed in RequiredHeaders, ignoring case.
+func IsRequiredHeader(name string) bool {
+	for _, r := range RequiredHeaders {
+		if strings.EqualFold(r, name) {
+			return true
+		}
+	}
+	return false
+}
 
 const (
 	HeaderKafkaKey         = "x-kafka-key"

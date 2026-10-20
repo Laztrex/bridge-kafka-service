@@ -93,3 +93,41 @@ The publish path MUST answer `405 Method Not Allowed` (with an `Allow: POST` hea
 #### Scenario: POST still routed
 - **WHEN** a client sends `POST /api/v{version}/publish`
 - **THEN** it is handled according to the existing publish requirements
+
+### Requirement: Listener timeouts
+
+The public HTTP listener (`http.addr`) MUST close a connection whose request headers are not read within 10 seconds, whose whole request is not read within 30 seconds, or that stays idle between requests for more than 120 seconds. It MUST NOT bound the time spent writing a response, so a publish that waits for Kafka is not cut off after the record may already have been written.
+
+#### Scenario: Slow request body
+
+- **WHEN** a client sends the headers of a publish request and then sends the body slower than it can finish within 30 seconds
+- **THEN** the server closes the connection and no record is published
+
+#### Scenario: Idle keep-alive connection
+
+- **WHEN** a client keeps a connection open without sending another request for more than 120 seconds
+- **THEN** the server closes the connection
+
+#### Scenario: Slow publish
+
+- **WHEN** a publish request is read promptly but writing the record to Kafka takes 40 seconds
+- **THEN** the client still receives the publish result
+
+### Requirement: Required headers on publish requests
+
+A publish request that lacks a header listed under `tracking-enrichment` "Required headers" MUST be rejected before the body is read, with HTTP 422 and the structured failure body naming the missing header, and nothing MUST be published. A listed header present on the request MUST be carried onto the produced record under its lowercase wire name. With the list empty, publish requests are handled exactly as before.
+
+#### Scenario: Empty list
+
+- **WHEN** the required list is empty and a publish request carries no tracking headers
+- **THEN** the request is handled as before: defaults are applied and the record is published
+
+#### Scenario: Required header missing
+
+- **WHEN** `x-client-id` is in the required list and a publish request has no `x-client-id`
+- **THEN** the response is HTTP 422 with a JSON body whose detail names `x-client-id`, the body is not read and no record is published
+
+#### Scenario: Required header present
+
+- **WHEN** `x-client-id` is in the required list and a publish request carries it
+- **THEN** the request is handled like any other and the produced record carries `x-client-id` with the request's value, although `x-client-id` is not a custom-prefixed header

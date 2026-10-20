@@ -26,6 +26,10 @@ func ProduceResponse(msg string, w http.ResponseWriter) {
 // the publish queue; the record stays unsettled and is redelivered.
 var errPublishAbandoned = errors.New("response publication abandoned on shutdown")
 
+// errPublishQueueFull: under on_failure: skip the response found its pipeline's publish queue full
+// and was dropped; it is recorded as a failed publication.
+var errPublishQueueFull = errors.New("publish queue is full, response dropped")
+
 // trackingHeaders are written under their lowercase wire names, never in
 // net/http's canonical form.
 var trackingHeaders = []string{
@@ -34,10 +38,18 @@ var trackingHeaders = []string{
 
 // publishUpstreamResponse queues the response event in the pipeline's queue for the response
 // topic (if any) and hands it the ack. The event carries the stanza config, so the response publisher can apply its
-// failure policy. On a full queue the response is dropped, unless wait is set (on_failure: retry):
-// then it waits until abandon is cancelled and returns errPublishAbandoned, keeping the ack.
+// failure policy. On a full queue the response is dropped and recorded as a failed publication,
+// unless wait is set (on_failure: retry): then it waits until abandon is cancelled and returns
+// errPublishAbandoned, keeping the ack.
 // Tracking headers are always set under their wire names, even if the upstream did not echo them.
-func publishUpstreamResponse(abandon context.Context, msg *schemas.ConsumerEvent, resp UpstreamResponse, queue chan<- *schemas.ConsumerEvent, wait bool) error {
+func publishUpstreamResponse(
+	abandon context.Context,
+	logTransaction schemas.TransactionLogger,
+	msg *schemas.ConsumerEvent,
+	resp UpstreamResponse,
+	queue chan<- *schemas.ConsumerEvent,
+	wait bool,
+) error {
 	if msg.ResponseTopic == "" {
 		return nil
 	}
@@ -67,11 +79,7 @@ func publishUpstreamResponse(abandon context.Context, msg *schemas.ConsumerEvent
 		publishMsg.Headers[consts.HeaderClientId] = clientId
 	}
 
-	if err := middlewares.HeaderHttpHandler(header, publishMsg); err != nil {
-		log.Error().Str(consts.HeaderRequestIdKey, msg.Values.RequestId).
-			Err(err).Msg("error processing response headers")
-		return err
-	}
+	middlewares.HeaderHttpHandler(header, publishMsg)
 
 	publishEvent := &schemas.ConsumerEvent{
 		Values: &schemas.ContextValues{
@@ -83,7 +91,7 @@ func publishUpstreamResponse(abandon context.Context, msg *schemas.ConsumerEvent
 		ResponseTopic: msg.ResponseTopic,
 		Config:        msg.Config,
 	}
-	publishEvent.SetAck(msg.TakeAck())
+	msg.HandOver(publishEvent)
 
 	if wait {
 		select {
@@ -91,7 +99,7 @@ func publishUpstreamResponse(abandon context.Context, msg *schemas.ConsumerEvent
 			log.Debug().Str(consts.HeaderRequestIdKey, msg.Values.RequestId).
 				Msg("response event sent to publish queue")
 		case <-abandon.Done():
-			msg.SetAck(publishEvent.TakeAck())
+			publishEvent.HandOver(msg)
 			return errPublishAbandoned
 		}
 		return nil
@@ -104,6 +112,10 @@ func publishUpstreamResponse(abandon context.Context, msg *schemas.ConsumerEvent
 	default:
 		log.Warn().Str(consts.HeaderRequestIdKey, msg.Values.RequestId).
 			Msg("publish queue is full, dropping response event")
+		publishEvent.Event = &schemas.Event{EventType: consts.EventResponseService, RequestId: publishEvent.Values.RequestId}
+		logTransaction.Start(publishEvent.Event)
+		logTransaction.RecordPublishOutcome(publishEvent.Values, publishEvent.Event, publishEvent.Event.Started, errPublishQueueFull)
+		logTransaction.Close(publishEvent.Event)
 		publishEvent.Ack()
 	}
 	return nil

@@ -31,11 +31,23 @@ type Consumer struct {
 	out       chan<- *schemas.ConsumerEvent // records handed to the response handler
 	ready     chan bool
 	readyOnce sync.Once
+
+	// settleWait bounds how long an ending claim waits for its records to settle (zero: no wait).
+	settleWait time.Duration
+	// deadline, once set by a stopping pipeline, also bounds that wait.
+	deadline *transport.DrainDeadline
+	// state receives the pipeline's uncommitted count (nil: not reported).
+	state *transport.PipelineState
+	// pause is the process-wide pause state (nil: never paused); group is the consumer group it
+	// pauses the claims of.
+	pause *Pause
+	group sarama.ConsumerGroup
 }
 
 // RunSubscription runs the consume loop and the response handler of one subscription until
 // parent is cancelled or consumption ends; responses go to queue, the pipeline's own
-// publication queue (nil when the stanza has no response_topic). Each value on toggle flips pause/resume. On stop,
+// publication queue (nil when the stanza has no response_topic), and its runtime state goes to state
+// (nil: not reported). The subscription follows pause, the process-wide pause state. On stop,
 // consumption is cancelled before the event channel is closed, since ConsumeClaim may still send.
 // A non-nil return means a permanent inability to start consuming (the upstream cannot be
 // constructed, the consumer group cannot be created): the error names the stanza's topics and
@@ -43,14 +55,13 @@ type Consumer struct {
 // end) returns nil; transient consume-loop errors keep their 5-second retry.
 func RunSubscription(
 	parent context.Context,
-	toggle <-chan struct{},
+	pause *Pause,
 	consumerClient sarama.Client,
 	consumerConfig *schemas.ConsumerConfig,
 	queue chan<- *schemas.ConsumerEvent,
 	logger *observability.FileTransactionLogger,
+	state *transport.PipelineState,
 ) error {
-	consumptionIsPaused := false
-
 	upstream, err := transport.NewUpstream(consumerConfig)
 	if err != nil {
 		log.Error().Msgf("cannot create upstream for topics %v: %v", consumerConfig.Topics, err)
@@ -61,7 +72,14 @@ func RunSubscription(
 	}
 
 	ch := make(chan *schemas.ConsumerEvent, 1000)
-	consumer := &Consumer{config: consumerConfig, logger: logger, out: ch, ready: make(chan bool)}
+	drainDeadline := &transport.DrainDeadline{}
+	consumer := &Consumer{
+		config: consumerConfig, logger: logger, out: ch, ready: make(chan bool),
+		settleWait: min(transport.DrainWindow(consumerConfig), consumerClient.Config().Consumer.Group.Rebalance.Timeout),
+		deadline:   drainDeadline,
+		state:      state,
+		pause:      pause,
+	}
 
 	ctx, cancel := context.WithCancel(parent)
 
@@ -80,17 +98,21 @@ func RunSubscription(
 			log.Error().Msgf("error closing consumer group: %v", err)
 		}
 	}()
+	consumer.group = client
+	pause.Register(client)
+	defer pause.Unregister(client)
 
 	processingCtx, processingCancel := context.WithCancel(context.Background())
 	defer processingCancel()
+	processingCtx = transport.WithDrainDeadline(processingCtx, drainDeadline)
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		if consumerConfig.Service.MaxConn > 0 {
-			transport.ConsumerResponseSlow(logger, consumerConfig, upstream, ch, queue, processingCtx)
+			transport.ConsumerResponseSlow(logger, consumerConfig, upstream, ch, queue, processingCtx, state)
 		} else {
-			transport.ConsumerResponseFast(logger, consumerConfig, upstream, ch, queue, processingCtx)
+			transport.ConsumerResponseFast(logger, consumerConfig, upstream, ch, queue, processingCtx, state)
 		}
 		log.Info().Msg("response handler terminated")
 	}()
@@ -138,18 +160,12 @@ func RunSubscription(
 		log.Info().Msg("terminating before consumer became ready")
 	}
 
-	for running := true; running; {
-		select {
-		case <-ctx.Done():
-			log.Info().Msg("terminating: context cancelled")
-			running = false
-		case <-toggle:
-			toggleConsumptionFlow(client, &consumptionIsPaused)
-		}
-	}
+	<-ctx.Done()
+	log.Info().Msg("terminating: context cancelled")
 
 	log.Info().Msg("shutting down consumer...")
 
+	drainDeadline.Start(transport.DrainWindow(consumerConfig))
 	cancel()
 	<-consumeDone
 	close(ch)
@@ -157,22 +173,6 @@ func RunSubscription(
 
 	log.Info().Msg("consumer fully terminated")
 	return nil
-}
-
-func toggleConsumptionFlow(client sarama.ConsumerGroup, isPaused *bool) {
-	if client == nil {
-		log.Warn().Msg("cannot toggle consumption flow: consumer group client is not available")
-		return
-	}
-
-	if *isPaused {
-		client.ResumeAll()
-		log.Info().Msg("resuming consumption")
-	} else {
-		client.PauseAll()
-		log.Info().Msg("pausing consumption")
-	}
-	*isPaused = !*isPaused
 }
 
 func (k *Consumer) Setup(sarama.ConsumerGroupSession) error {
@@ -197,22 +197,32 @@ type pendingOffset struct {
 // (service call finished and the response handed to Kafka, or processing failed),
 // and only in consumption order: an offset is never committed while an earlier
 // one is still in flight, so a crash re-delivers unfinished work instead of losing it.
+// It also counts the records handed out and not yet settled or abandoned, so an ending
+// claim can wait for them before sarama makes its final commit, and reports the records not yet
+// marked to state as the pipeline's uncommitted count.
 type offsetTracker struct {
-	mu      sync.Mutex
-	session sarama.ConsumerGroupSession
-	pending []*pendingOffset
+	mu          sync.Mutex
+	session     sarama.ConsumerGroupSession
+	pending     []*pendingOffset
+	outstanding int
+	idle        chan struct{} // closed when outstanding drops to zero while a claim waits
+	state       *transport.PipelineState
+	ended       bool // the claim has ended: its unmarked records no longer count as uncommitted
 }
 
-// track registers msg and returns an idempotent ack func that settles it.
-func (t *offsetTracker) track(msg *sarama.ConsumerMessage) func() {
+// track registers msg and returns its ack, which settles it, and its abandon, which gives it up
+// unsettled (it is then redelivered). Only the first of the two calls has an effect.
+func (t *offsetTracker) track(msg *sarama.ConsumerMessage) (ack, abandon func()) {
 	p := &pendingOffset{msg: msg}
 
 	t.mu.Lock()
 	t.pending = append(t.pending, p)
+	t.outstanding++
+	t.state.AddUncommitted(1)
 	t.mu.Unlock()
 
 	var once sync.Once
-	return func() {
+	ack = func() {
 		once.Do(func() {
 			t.mu.Lock()
 			defer t.mu.Unlock()
@@ -222,18 +232,82 @@ func (t *offsetTracker) track(msg *sarama.ConsumerMessage) func() {
 				t.session.MarkMessage(t.pending[0].msg, "")
 				t.pending[0] = nil
 				t.pending = t.pending[1:]
+				if !t.ended {
+					t.state.AddUncommitted(-1)
+				}
 			}
+			t.release()
 		})
+	}
+	abandon = func() {
+		once.Do(func() {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			t.release()
+		})
+	}
+	return ack, abandon
+}
+
+// release accounts for one settled or abandoned record; t.mu must be held.
+func (t *offsetTracker) release() {
+	t.outstanding--
+	if t.outstanding == 0 && t.idle != nil {
+		close(t.idle)
+		t.idle = nil
 	}
 }
 
+// end stops counting the claim's unmarked records as uncommitted: they are redelivered to the
+// partition's next owner.
+func (t *offsetTracker) end() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.ended {
+		t.ended = true
+		t.state.AddUncommitted(-int64(len(t.pending)))
+	}
+}
+
+// waitSettled waits until every handed-out record has settled or been abandoned, at most d.
+// It returns the number of records still outstanding.
+func (t *offsetTracker) waitSettled(d time.Duration) int {
+	t.mu.Lock()
+	if t.outstanding == 0 || d <= 0 {
+		n := t.outstanding
+		t.mu.Unlock()
+		return n
+	}
+	idle := make(chan struct{})
+	t.idle = idle
+	t.mu.Unlock()
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-idle:
+	case <-timer.C:
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.idle = nil
+	return t.outstanding
+}
+
 // ConsumeClaim hands every record to the response handler. Each record gets fresh objects (they
-// escape into other goroutines), and its audit duration spans consumption to hand-over.
+// escape into other goroutines), and its audit duration spans consumption to hand-over. When the
+// session ends it stops reading and waits, up to settleWait, for the records it handed out to
+// settle or be abandoned, so their marks reach sarama's final commit instead of being dropped.
+// While the process is paused the claim's partition is paused and no record is handed out: a
+// received record waits, untracked, until resume, and is redelivered if the session ends first.
 func (k *Consumer) ConsumeClaim(
 	session sarama.ConsumerGroupSession,
 	claim sarama.ConsumerGroupClaim,
 ) error {
-	tracker := &offsetTracker{session: session}
+	tracker := &offsetTracker{session: session, state: k.state}
+	defer k.waitForClaim(tracker, claim)
+	k.pause.PauseClaim(k.group, claim.Topic(), claim.Partition())
 
 	for {
 		select {
@@ -242,19 +316,24 @@ func (k *Consumer) ConsumeClaim(
 				log.Info().Msg("message channel was closed")
 				return nil
 			}
+			if !k.pause.Wait(session.Context()) {
+				return nil
+			}
 
 			transaction := k.logger
 
 			body := &schemas.RequestBody{}
 			eventConsume := &schemas.Event{EventType: consts.EventConsume}
 			transaction.Start(eventConsume)
-			ack := tracker.track(message)
+			ack, abandon := tracker.track(message)
 
 			value := codec.PrepareConsumeMsg(message, eventConsume, body)
 
 			value.ResponseTopic = k.config.ResponseTopic
 			value.Config = k.config
+			value.ClaimCtx = session.Context()
 			value.SetAck(ack)
+			value.SetAbandon(abandon)
 
 			value.Values = &schemas.ContextValues{
 				RequestId: eventConsume.RequestId,
@@ -265,6 +344,7 @@ func (k *Consumer) ConsumeClaim(
 
 			select {
 			case <-session.Context().Done():
+				abandon()
 				return nil
 			case k.out <- value:
 			}
@@ -284,6 +364,21 @@ func (k *Consumer) ConsumeClaim(
 		case <-session.Context().Done():
 			return nil
 		}
+	}
+}
+
+// waitForClaim holds an ending claim until its records have settled or been abandoned, bounded by
+// settleWait and, on shutdown, by the pipeline's drain deadline; records still outstanding after
+// that are redelivered and no longer count as uncommitted.
+func (k *Consumer) waitForClaim(tracker *offsetTracker, claim sarama.ConsumerGroupClaim) {
+	defer tracker.end()
+	wait := k.settleWait
+	if at, ok := k.deadline.At(); ok {
+		wait = min(wait, time.Until(at))
+	}
+	if left := tracker.waitSettled(wait); left > 0 {
+		log.Warn().Msgf("claim %s/%d ended with %d records still in flight: they will be redelivered",
+			claim.Topic(), claim.Partition(), left)
 	}
 }
 

@@ -37,15 +37,16 @@ func RequestIdMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
-		processedHeaders, err := ProcessHeaders(r.Header)
+		processedHeaders := ProcessHeaders(r.Header)
 		requestId := processedHeaders[consts.HeaderRequestIdKey]
-		if err != nil {
-			msg := fmt.Sprintf("Error processing headers: %v", err)
+
+		setHttpHeaders(w, processedHeaders)
+
+		if name := missingRequiredHeader(r.Header); name != "" {
+			msg := fmt.Sprintf("RequestHeader not contains required header '%s'", name)
 			errCheckRequest(w, requestId, msg, http.StatusUnprocessableEntity)
 			return
 		}
-
-		setHttpHeaders(w, processedHeaders)
 
 		produceTopicName := r.Header.Get(consts.HeaderProduceTopicName)
 		if produceTopicName == "" {
@@ -60,7 +61,7 @@ func RequestIdMiddleware(next http.Handler) http.Handler {
 
 		setKafkaHeaders(r.Header, body)
 
-		err = getBodyRequest(w, r, body, requestId)
+		err := getBodyRequest(w, r, body, requestId)
 		if err != nil {
 			return
 		}

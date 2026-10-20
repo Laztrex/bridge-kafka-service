@@ -1,6 +1,7 @@
 package schemas
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -19,6 +20,35 @@ func TestConsumerEvent_AckHandoff(t *testing.T) {
 
 	dst.Ack()
 	assert.Equal(t, 1, calls)
+}
+
+func TestConsumerEvent_HandOverMovesSettlementAndClaim(t *testing.T) {
+	acks, abandons := 0, 0
+	ctx, cancel := context.WithCancel(context.Background())
+	src := &ConsumerEvent{ClaimCtx: ctx}
+	src.SetAck(func() { acks++ })
+	src.SetAbandon(func() { abandons++ })
+
+	dst := &ConsumerEvent{}
+	src.HandOver(dst)
+	src.Ack()
+	src.Abandon()
+	assert.Zero(t, acks+abandons, "the source no longer settles")
+
+	assert.False(t, dst.ClaimEnded())
+	cancel()
+	assert.True(t, dst.ClaimEnded(), "the claim context travels with the callbacks")
+	dst.Abandon()
+	dst.Ack()
+	assert.Equal(t, 1, abandons)
+	assert.Equal(t, 1, acks)
+}
+
+func TestConsumerEvent_WithoutClaim(t *testing.T) {
+	e := &ConsumerEvent{}
+	assert.False(t, e.ClaimEnded())
+	assert.Nil(t, e.ClaimDone())
+	assert.NotPanics(t, e.Abandon)
 }
 
 func TestConsumerEvent_AckWithoutCallback(t *testing.T) {

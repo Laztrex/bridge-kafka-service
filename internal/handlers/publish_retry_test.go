@@ -58,6 +58,17 @@ func TestIsNonTransientPublishError(t *testing.T) {
 				{Msg: &sarama.ProducerMessage{Topic: "out"}, Err: sarama.ErrMessageSizeTooLarge},
 				{Msg: &sarama.ProducerMessage{Topic: "out"}, Err: sarama.ErrOutOfBrokers},
 			}, false},
+		{"record larger than the producer limit",
+			sarama.ConfigurationError("Attempt to produce message larger than configured Producer.MaxMessageBytes: 2000000 > 1048576"), true},
+		{"headers on a Kafka version without them",
+			sarama.ConfigurationError("Producing headers requires Kafka at least v0.11"), true},
+		{"producer error wrapping a client-side refusal",
+			&sarama.ProducerError{Msg: &sarama.ProducerMessage{Topic: "out"}, Err: sarama.ConfigurationError("too large")}, true},
+		{"batch of client-side refusals",
+			sarama.ProducerErrors{
+				{Msg: &sarama.ProducerMessage{Topic: "out"}, Err: sarama.ConfigurationError("too large")},
+				{Msg: &sarama.ProducerMessage{Topic: "out"}, Err: sarama.ErrMessageSizeTooLarge},
+			}, true},
 		{"out of brokers", sarama.ErrOutOfBrokers, false},
 		{"not leader for partition", sarama.ErrNotLeaderForPartition, false},
 		{"timeout", context.DeadlineExceeded, false},
@@ -186,7 +197,7 @@ func TestPublishOneRetry_FailsTwiceThenSucceeds(t *testing.T) {
 	producer.ExpectSendMessageAndSucceed()
 	ev, acks := newPublishEvent("resp", true)
 
-	publishOne(context.Background(), l, reg, ev)
+	publishOne(context.Background(), l, reg, ev, nil)
 	l.Shutdown()
 
 	assert.Equal(t, int32(1), atomic.LoadInt32(acks), "acked once, after publication succeeds")
@@ -196,6 +207,52 @@ func TestPublishOneRetry_FailsTwiceThenSucceeds(t *testing.T) {
 	assert.Equal(t, 1, countMetricValue(t, file, consts.MetricsSuccessMapName[consts.EventResponseService], "1"),
 		"exactly one success outcome is recorded")
 	assert.Zero(t, countMetricValue(t, file, consts.MetricsFailureMapName[consts.EventResponseService], "1"))
+}
+
+func TestPublishOneRetry_WarningStatesHowLongTheResponseHasBeenFailing(t *testing.T) {
+	fastPublishBackoff(t, 5*time.Millisecond, 5*time.Millisecond)
+	logs := captureLogs(t)
+	l, _ := publishLogger(t)
+	reg, producer := newMockRegistry(t, "resp")
+	producer.ExpectSendMessageAndFail(errPublishDown)
+	producer.ExpectSendMessageAndFail(errPublishDown)
+	producer.ExpectSendMessageAndSucceed()
+	ev, _ := newPublishEvent("resp", true)
+
+	publishOne(context.Background(), l, reg, ev, nil)
+
+	var got []float64
+	logs.mu.Lock()
+	for _, line := range strings.Split(strings.TrimSpace(logs.b.String()), "\n") {
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry))
+		if entry["message"] == "response publish failed, retrying" {
+			v, ok := entry["failing_for"].(float64)
+			require.True(t, ok, "failing_for missing in %s", line)
+			got = append(got, v)
+		}
+	}
+	logs.mu.Unlock()
+	require.Len(t, got, 2)
+	assert.Less(t, got[0], got[1])
+}
+
+func TestPublishOneRetry_RetriedPublicationIsListedInTheState(t *testing.T) {
+	fastPublishBackoff(t, time.Hour, time.Hour)
+	l, _ := publishLogger(t)
+	reg, producer := newMockRegistry(t, "resp")
+	producer.ExpectSendMessageAndFail(errPublishDown)
+	ev, _ := newPublishEvent("resp", true)
+	state := transport.NewPipelineState()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	go func() { defer close(done); publishOne(ctx, l, reg, ev, state) }()
+	require.Eventually(t, func() bool { return state.Snapshot().RetryingPublications == 1 }, time.Second, 5*time.Millisecond)
+	cancel()
+	<-done
+
+	assert.Equal(t, transport.PipelineSnapshot{}, state.Snapshot(), "removed when the loop ends")
 }
 
 func TestPublishOneRetry_ContextCancelledDuringBackoffDoesNotAck(t *testing.T) {
@@ -210,7 +267,7 @@ func TestPublishOneRetry_ContextCancelledDuringBackoffDoesNotAck(t *testing.T) {
 
 	go func() {
 		defer close(done)
-		publishOne(ctx, l, reg, ev)
+		publishOne(ctx, l, reg, ev, nil)
 	}()
 	require.Eventually(t, func() bool { return logs.count("response publish failed, retrying") == 1 },
 		3*time.Second, 5*time.Millisecond, "the first attempt must fail before the wait")
@@ -234,7 +291,7 @@ func TestPublishOneRetry_NonTransientErrorSettlesAfterOneAttempt(t *testing.T) {
 	producer.ExpectSendMessageAndFail(sarama.ErrMessageSizeTooLarge)
 	ev, acks := newPublishEvent("resp", true)
 
-	publishOne(context.Background(), l, reg, ev)
+	publishOne(context.Background(), l, reg, ev, nil)
 	l.Shutdown()
 
 	assert.Equal(t, int32(1), atomic.LoadInt32(acks), "a non-transient error settles the record")
@@ -243,6 +300,59 @@ func TestPublishOneRetry_NonTransientErrorSettlesAfterOneAttempt(t *testing.T) {
 	assert.Zero(t, logs.count("response publish failed, retrying"), "the write is not repeated")
 	assert.Equal(t, 1, countMetricValue(t, file, consts.MetricsFailureMapName[consts.EventResponseService], "1"),
 		"the failure is recorded once")
+}
+
+// A response larger than the producer limit is refused by the client before sending: it must be
+// settled as a failure after one attempt, not retried forever with its offset held.
+func TestPublishOneRetry_OversizedResponseSettlesAfterOneAttempt(t *testing.T) {
+	logs := captureLogs(t)
+	l, file := publishLogger(t)
+	reg, producer := newMockRegistry(t, "resp")
+	producer.ExpectSendMessageAndFail(sarama.ConfigurationError(
+		"Attempt to produce message larger than configured Producer.MaxMessageBytes: 2000000 > 1048576"))
+	ev, acks := newPublishEvent("resp", true)
+
+	publishOne(context.Background(), l, reg, ev, nil)
+	l.Shutdown()
+
+	assert.Equal(t, int32(1), atomic.LoadInt32(acks), "the record is settled")
+	assert.Equal(t, 1, ev.Event.Failure)
+	assert.Zero(t, ev.Event.Success)
+	assert.Zero(t, logs.count("response publish failed, retrying"), "the write is not repeated")
+	assert.Equal(t, 1, countMetricValue(t, file, consts.MetricsFailureMapName[consts.EventResponseService], "1"),
+		"the failure is recorded once")
+}
+
+// A retried publication stops as soon as its record's claim ends: the record now belongs to the
+// partition's next owner, so it is abandoned without settling and no outcome is recorded.
+func TestPublishOneRetry_StopsWhenTheClaimEnds(t *testing.T) {
+	fastPublishBackoff(t, 50*time.Millisecond, 50*time.Millisecond)
+	l, _ := publishLogger(t)
+	var sends atomic.Int32
+	reg := funcRegistry(func(*sarama.ProducerMessage) error {
+		sends.Add(1)
+		return errPublishDown
+	}, "resp")
+	ev, acks := newPublishEvent("resp", true)
+	claimCtx, endClaim := context.WithCancel(context.Background())
+	defer endClaim()
+	ev.ClaimCtx = claimCtx
+	var abandons atomic.Int32
+	ev.SetAbandon(func() { abandons.Add(1) })
+
+	done := make(chan struct{})
+	go func() { defer close(done); publishOne(context.Background(), l, reg, ev, nil) }()
+	require.Eventually(t, func() bool { return sends.Load() >= 1 }, 3*time.Second, 5*time.Millisecond)
+	endClaim()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the retry loop did not stop when the claim ended")
+	}
+	assert.Equal(t, int32(1), abandons.Load())
+	assert.Zero(t, atomic.LoadInt32(acks), "the record is not settled")
+	assert.Zero(t, ev.Event.Success+ev.Event.Failure, "no outcome is recorded")
 }
 
 func TestResponsePublishRetry_DrainGivesOneAttemptAndLeavesUnsettled(t *testing.T) {
@@ -264,7 +374,7 @@ func TestResponsePublishRetry_DrainGivesOneAttemptAndLeavesUnsettled(t *testing.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	done := make(chan struct{})
-	go func() { defer close(done); ResponsePublish(ctx, q, 1, l, reg) }()
+	go func() { defer close(done); ResponsePublish(ctx, q, 1, l, reg, nil) }()
 
 	select {
 	case <-done:
@@ -286,7 +396,7 @@ func TestPublishOneRetry_SkipEventKeepsSingleAttempt(t *testing.T) {
 	producer.ExpectSendMessageAndFail(errPublishDown)
 	ev, acks := newPublishEvent("resp", false)
 
-	publishOne(context.Background(), l, reg, ev)
+	publishOne(context.Background(), l, reg, ev, nil)
 
 	assert.Equal(t, int32(1), atomic.LoadInt32(acks), "a skip event settles after one attempt")
 	assert.Equal(t, 1, ev.Event.Failure)

@@ -54,7 +54,7 @@ func NewHandlers(
 // holds back only that pipeline. It must run whenever its pipeline is active, even with no
 // producers configured (events are then failed and settled instead of piling up).
 // Responses of on_failure: retry stanzas are retried with backoff until they
-// are written (design D1); after ctx is cancelled the drain gives every queued
+// are written (baseline decision PUB-1); after ctx is cancelled the drain gives every queued
 // event a single attempt, so no new waits are added on shutdown.
 func ResponsePublish(
 	ctx context.Context,
@@ -62,13 +62,14 @@ func ResponsePublish(
 	workers int,
 	logTransaction schemas.TransactionLogger,
 	producers ProducerLookup,
+	state *transport.PipelineState,
 ) {
 	var wg sync.WaitGroup
 	for range max(workers, 1) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			publishFrom(ctx, queue, logTransaction, producers)
+			publishFrom(ctx, queue, logTransaction, producers, state)
 		}()
 	}
 	wg.Wait()
@@ -76,16 +77,16 @@ func ResponsePublish(
 
 // publishFrom is one publisher of a queue: it publishes events while ctx is alive, then gives
 // every event still queued one attempt and returns when the queue is empty.
-func publishFrom(ctx context.Context, queue <-chan *schemas.ConsumerEvent, logTransaction schemas.TransactionLogger, producers ProducerLookup) {
+func publishFrom(ctx context.Context, queue <-chan *schemas.ConsumerEvent, logTransaction schemas.TransactionLogger, producers ProducerLookup, state *transport.PipelineState) {
 	for {
 		select {
 		case msg := <-queue:
-			publishOne(ctx, logTransaction, producers, msg)
+			publishOne(ctx, logTransaction, producers, msg, state)
 		case <-ctx.Done():
 			for {
 				select {
 				case msg := <-queue:
-					publishOne(ctx, logTransaction, producers, msg)
+					publishOne(ctx, logTransaction, producers, msg, state)
 				default:
 					return
 				}
@@ -94,14 +95,14 @@ func publishFrom(ctx context.Context, queue <-chan *schemas.ConsumerEvent, logTr
 	}
 }
 
-func publishOne(ctx context.Context, logTransaction schemas.TransactionLogger, producers ProducerLookup, msg *schemas.ConsumerEvent) {
+func publishOne(ctx context.Context, logTransaction schemas.TransactionLogger, producers ProducerLookup, msg *schemas.ConsumerEvent, state *transport.PipelineState) {
 	msg.Event = &schemas.Event{
 		EventType: consts.EventResponseService,
 		RequestId: msg.Values.RequestId,
 	}
 
 	if msg.Config != nil && msg.Config.EffectiveFailurePolicy() == schemas.FailureRetry {
-		publishOneRetrying(ctx, logTransaction, producers, msg)
+		publishOneRetrying(ctx, logTransaction, producers, msg, state)
 		return
 	}
 

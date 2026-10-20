@@ -11,7 +11,7 @@ This capability is the single owner of tracking-header behaviour for every entry
 - `x-request-time`: optional; defaults to the current UTC timestamp
 - `x-trace-id`: optional; defaults to the resulting `x-request-id`
 
-Later rules MAY observe earlier results. When an upstream HTTP response omits tracking headers, the originating request's `x-request-id` and `x-client-id` MUST be carried onto the response record.
+Later rules MAY observe earlier results. When an upstream HTTP response omits tracking headers, the originating request's `x-request-id` and `x-client-id` MUST be carried onto the response record. A header listed under "Required headers" is not optional: it gets no default at the entry points that requirement covers, and its absence is handled there. A request id is still generated for logs, metrics and audit when the input has none.
 
 #### Scenario: Inbound record missing Request-Id
 - **WHEN** a record or request arrives without `x-request-id`
@@ -24,6 +24,10 @@ Later rules MAY observe earlier results. When an upstream HTTP response omits tr
 #### Scenario: Upstream omits tracking headers
 - **WHEN** the upstream response carries none of the tracking headers
 - **THEN** the response record carries the originating `x-request-id` and `x-client-id`
+
+#### Scenario: Required request id is not defaulted
+- **WHEN** `x-request-id` is in the required list and a record arrives without it
+- **THEN** no `x-request-id` header is added to the record, the record is handled by "Required headers", and its logs, metrics and audit carry a generated id
 
 ### Requirement: System identity propagation
 The system MUST stamp the `Client-Id` header on every outbound forwarded record with the value sourced from the runtime `SYSTEM_ID` environment variable. A missing env var yields an empty `Client-Id` value rather than blocking processing.
@@ -56,7 +60,7 @@ Headers starting with the application-defined custom prefix on incoming HTTP tra
 
 #### Scenario: Kafka→HTTP forward
 - **WHEN** a Kafka record whose headers include arbitrary user keys flows toward an upstream HTTP service
-- **THEN** the existing header keys and values reach the upstream service unchanged, without applying the custom-prefix rule
+- **THEN** the existing header keys and values reach the upstream service unchanged, without applying the custom-prefix rule, except the headers covered by "Transport-controlled headers" and "Headers the upstream transport cannot carry"
 
 ### Requirement: Trace continuity across hops
 Within a single round-trip, the `Trace-Id` value used when emitting metric lines and audit entries MUST equal the `Request-Id` driving the request. Operators correlating logs MUST see identical trace identifiers end-to-end.
@@ -64,3 +68,109 @@ Within a single round-trip, the `Trace-Id` value used when emitting metric lines
 #### Scenario: Round-trip correlation
 - **WHEN** a record enters consume, traverses upstream forwarding, then exits via produce
 - **THEN** all metric-file lines and audit entries associated with that request share a single common `Request-Id`-shaped identifier
+
+### Requirement: Required headers
+
+The system MUST keep one built-in list of required headers, empty in this release, applied at both entry points: records consumed from Kafka and publish API requests. Names are matched case-insensitively. A listed header MUST NOT get a default value. A consumed record whose listed header is absent, or invalid for the upstream transport, MUST NOT be sent and MUST be settled as a non-retryable upstream failure (see `message-routing`). Upstream responses are not checked.
+
+#### Scenario: Empty list
+
+- **WHEN** the required list is empty and a record arrives without `x-request-id` and `x-client-id`
+- **THEN** the record is processed exactly as before: both headers get their defaults and the upstream is called
+
+#### Scenario: Required header absent from a record
+
+- **WHEN** `x-client-id` is in the required list and a consumed record has no `x-client-id` header
+- **THEN** the upstream is not called, the failure is recorded and logged with the request id and `x-client-id`, and the offset is settled
+
+#### Scenario: Required header invalid for the transport
+
+- **WHEN** `x-request-id` is in the required list and a record on an HTTP pipeline carries `x-request-id` with a carriage return in its value
+- **THEN** the upstream is not called and the record is settled as failure; the request id used in logs, metrics and audit is still the record's value
+
+#### Scenario: Required header absent from a publish request
+
+- **WHEN** `x-client-id` is in the required list and a publish request has no `x-client-id` header
+- **THEN** the request is rejected as described in `control-api` "Required headers on publish requests" and nothing is published
+
+#### Scenario: Upstream response without a listed header
+
+- **WHEN** `x-trace-id` is in the required list and an upstream response carries no `x-trace-id`
+- **THEN** the response is published as before
+
+#### Scenario: Case-insensitive match
+
+- **WHEN** `x-client-id` is in the required list and a record carries the header as `X-Client-Id`
+- **THEN** the header counts as present
+
+#### Scenario: Required names are never transport-controlled
+
+- **WHEN** the built-in required list is inspected
+- **THEN** none of its names is a transport-controlled header (see "Transport-controlled headers")
+
+### Requirement: Tracking headers ignore letter case
+
+A tracking header of a consumed record (`x-request-id`, `x-request-time`, `x-trace-id`, `x-client-id`) MUST be recognised in any letter case and stored under its lowercase wire name before any other rule applies. When a record carries several spellings of one header, the lowercase spelling MUST win, otherwise the first in byte order; the other spellings MUST be dropped.
+
+#### Scenario: Canonical-case request id
+
+- **WHEN** a record carries `X-Request-Id: abc` and no `x-request-id`
+- **THEN** `abc` is the request id in logs, metrics and audit, no new id is generated, the upstream receives it as `x-request-id`, and the response record carries `x-request-id: abc`
+
+#### Scenario: Canonical-case client id
+
+- **WHEN** a record carries `X-Client-Id: billing`
+- **THEN** the record carries exactly one `x-client-id`, with the value `billing`, and no default from `SYSTEM_ID` is added beside it
+
+#### Scenario: Two spellings
+
+- **WHEN** a record carries both `x-request-id: lower` and `X-Request-Id: upper`
+- **THEN** the request id is `lower` and only `x-request-id` is forwarded
+
+### Requirement: Headers the upstream transport cannot carry
+
+A non-required header of a consumed record that the upstream transport cannot carry MUST be left out of the upstream call only, with a warning naming the header and the request id; the record MUST still be processed. HTTP cannot carry an invalid field name, or a value with a control character other than tab. gRPC cannot carry text that is not valid UTF-8, or a metadata `x-request-id` that is not printable ASCII.
+
+#### Scenario: Line feed in an optional header over HTTP
+
+- **WHEN** a record on an HTTP pipeline carries the header `note` with the value `a\nb`
+- **THEN** the upstream is called without `note`, a warning names `note` and the request id, and the response is handled like any other
+
+#### Scenario: Same header over gRPC
+
+- **WHEN** the same record is consumed on a gRPC pipeline
+- **THEN** `note` is sent in `details` unchanged, because gRPC can carry it
+
+#### Scenario: Invalid UTF-8 over gRPC
+
+- **WHEN** a record on a gRPC pipeline carries a header whose value is not valid UTF-8 and is not required
+- **THEN** the header is left out of `details` with a warning, and the call is made
+
+#### Scenario: Optional tracking header is invalid
+
+- **WHEN** the required list is empty and a record on an HTTP pipeline carries `x-request-id` with a line feed
+- **THEN** the record's `x-request-id` is left out of the call (the HTTP client then stamps a newly generated one, as for any outgoing call without it), a warning is logged, and the response record still carries the record's `x-request-id`
+
+### Requirement: Transport-controlled headers
+
+Headers whose meaning belongs to the HTTP connection or message framing MUST NOT be taken from a consumed record into an HTTP upstream call: the hop-by-hop headers (`Connection`, `Proxy-Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`), `Host`, `Content-Length` and `Content-Type`. They are left out without a warning, and the call MUST carry `Content-Type: application/json`.
+
+#### Scenario: Record carries Content-Type
+
+- **WHEN** a record on an HTTP pipeline carries `Content-Type: text/plain`
+- **THEN** the upstream receives `Content-Type: application/json` and no warning is logged
+
+#### Scenario: Chained bridge
+
+- **WHEN** a record was published by another bridge from an upstream response and carries `Content-Length`, `Connection` and `Keep-Alive`
+- **THEN** none of them is sent to the upstream, and the call's own framing is used
+
+#### Scenario: JSON subtype from a record
+
+- **WHEN** a record on an HTTP pipeline carries `Content-Type: application/vnd.api+json`
+- **THEN** the upstream still receives `Content-Type: application/json`
+
+#### Scenario: gRPC is not affected
+
+- **WHEN** the same record is consumed on a gRPC pipeline
+- **THEN** every header, including `Content-Type`, is sent in `details` as data, and the call itself carries gRPC's own content type, which record headers cannot change

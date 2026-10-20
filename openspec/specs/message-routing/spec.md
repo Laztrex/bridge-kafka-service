@@ -115,7 +115,7 @@ The system MUST derive the upstream URL strictly from the consumer stanza fields
 - **THEN** the system's built-in default base path is used
 
 ### Requirement: Transport-neutral upstream contract
-Every upstream transport (HTTP today, gRPC in a future release) MUST implement the same interaction contract, and everything outside "perform the call" MUST be shared across transports and behave identically: the normalised payload and the Kafka record headers are sent to the upstream; the call is bounded by the consumer's timeout (default 30 seconds); the outcome is exactly one of "response (body + headers)" or "failure"; a failure is recorded in metrics and audit and is settled or retried according to the stanza's failure policy; a response is published to `response_topic` with tracking headers carried over from the originating record whenever the upstream omits them; without a `response_topic` the offset settles right after the call; the concurrency cap (`max_conn`) and fast/slow modes apply unchanged. A new transport MUST NOT introduce its own settlement, retry, header-enrichment or publication behaviour.
+Every upstream transport (HTTP today, gRPC in a future release) MUST implement the same interaction contract, and everything outside "perform the call" MUST be shared across transports and behave identically: the normalised payload and the Kafka record headers are sent to the upstream; the call is bounded by the consumer's timeout (default 30 seconds); the outcome is exactly one of "response (body + headers)" or "failure"; a failure is recorded in metrics and audit and is settled or retried according to the stanza's failure policy; a response is published to `response_topic` with tracking headers carried over from the originating record whenever the upstream omits them; without a `response_topic` the offset settles right after the call; the concurrency cap (`max_conn`) and fast/slow modes apply unchanged. A new transport MUST NOT introduce its own settlement, retry, header-enrichment or publication behaviour. Each transport MUST state which headers it cannot carry and MUST mark a call failure that depends only on the record or its response as non-retryable; the shared header policy (see `tracking-enrichment`) and "Non-retryable upstream failures" decide the outcome.
 
 #### Scenario: Same outcome regardless of transport
 - **WHEN** the same record is processed once over HTTP and once over a future gRPC transport against equivalent upstreams
@@ -132,6 +132,10 @@ Every upstream transport (HTTP today, gRPC in a future release) MUST implement t
 #### Scenario: Tracking headers absent from the upstream response
 - **WHEN** the upstream response carries no tracking headers
 - **THEN** the response record carries the originating `x-request-id` and `x-client-id`
+
+#### Scenario: Header a transport cannot carry
+- **WHEN** a record carries an optional header that one transport can carry and another cannot
+- **THEN** the transport that cannot carry it leaves it out under the shared policy, and everything else about the record's processing is identical on both transports
 
 ### Requirement: Upstream protocol selection
 Each consumer stanza MUST select its upstream protocol with `service.protocol`, either `http` or `grpc`. When omitted it MUST default to `http`, so existing configurations behave exactly as before. An unknown value MUST abort startup with an error naming the stanza. Everything defined by "Transport-neutral upstream contract" applies identically to both protocols; for `grpc`, `service.path` is not used (the method is fixed by the service contract).
@@ -164,7 +168,7 @@ Each consumer stanza MUST select how transport failures are handled with `on_fai
 - **THEN** the response is published to `response_topic` once and the call is not repeated
 
 ### Requirement: Retry until the upstream recovers
-With `on_failure: retry` a transport failure MUST NOT settle the offset. The system MUST repeat the call with exponential backoff, starting at about 1 second and capped at about 30 seconds, until the call yields a response, the record is skipped as poison, or the pipeline stops. Each failed attempt MUST be logged as a warning; failure metrics and audit MUST record only the record's final outcome.
+With `on_failure: retry` a transport failure MUST NOT settle the offset. The system MUST repeat the call with exponential backoff, starting at about 1 second and capped at about 30 seconds, until the call yields a response, the record is skipped as poison, or the pipeline stops. Each failed attempt MUST be logged as a warning that states the attempt number and how long the record has been failing since its first failed attempt; failure metrics and audit MUST record only the record's final outcome.
 
 #### Scenario: Upstream outage
 - **WHEN** the upstream is down for 10 minutes and then recovers
@@ -173,6 +177,10 @@ With `on_failure: retry` a transport failure MUST NOT settle the offset. The sys
 #### Scenario: One outcome per record
 - **WHEN** a record fails three attempts and succeeds on the fourth
 - **THEN** three warnings are logged and exactly one success, and no failure, is counted for it
+
+#### Scenario: Failing duration in the warning
+- **WHEN** a record has been failing for 2 minutes and its next attempt fails
+- **THEN** the warning for that attempt states the attempt number and a failing duration of about 2 minutes
 
 #### Scenario: Shutdown during retry
 - **WHEN** the pipeline stops while a record is waiting for its next attempt
@@ -206,7 +214,7 @@ A stanza with `on_failure: retry` MUST set `service.max_conn` greater than zero;
 
 ### Requirement: Response publication retry under retry policy
 
-For a stanza with `on_failure: retry`, a transient failure to write the upstream response to `response_topic` MUST NOT settle the offset. The system MUST repeat the write with the backoff of "Retry until the upstream recovers" until it succeeds or the service stops; the upstream MUST NOT be called again. Each failed attempt MUST be logged as a warning; metrics and audit MUST record only the final outcome of the response. A response whose write is being repeated MUST hold back only the responses of its own pipeline, never those of other pipelines.
+For a stanza with `on_failure: retry`, a transient failure to write the upstream response to `response_topic` MUST NOT settle the offset. The system MUST repeat the write with the backoff of "Retry until the upstream recovers" until it succeeds or the service stops; the upstream MUST NOT be called again. Each failed attempt MUST be logged as a warning that states the attempt number and how long the response has been failing since its first failed write; metrics and audit MUST record only the final outcome of the response. A response whose write is being repeated MUST hold back only the responses of its own pipeline, never those of other pipelines. A failure that cannot succeed on retry MUST NOT be repeated: the failure MUST be recorded and the offset settled. Such failures are an unmarshallable body, a broker rejection of the record itself (size or format), and a refusal by the Kafka client before sending, such as a record larger than `producer.maxmessagebytes` or a feature the configured Kafka version does not support.
 
 #### Scenario: Broker rejects writes temporarily
 
@@ -218,6 +226,11 @@ For a stanza with `on_failure: retry`, a transient failure to write the upstream
 - **WHEN** writing a retry stanza's response fails twice and succeeds on the third attempt
 - **THEN** two warnings are logged and exactly one success, and no failure, is recorded for the response
 
+#### Scenario: Failing duration in the publication warning
+
+- **WHEN** a retry stanza's response has been failing to be written for 2 minutes and the next write fails
+- **THEN** the warning for that attempt states the attempt number and a failing duration of about 2 minutes
+
 #### Scenario: Shutdown while publication is retried
 
 - **WHEN** the service stops while a retry stanza's response is waiting for its next write attempt
@@ -227,6 +240,11 @@ For a stanza with `on_failure: retry`, a transient failure to write the upstream
 
 - **WHEN** writing a retry stanza's response fails because the record exceeds the broker's size limit
 - **THEN** the write is not repeated, the failure is recorded and logged with the request id, and the offset is settled
+
+#### Scenario: Response larger than the producer limit
+
+- **WHEN** a retry stanza's response is larger than `producer.maxmessagebytes` (1 MiB by default)
+- **THEN** the write is attempted once, the failure is recorded and logged with the request id, the offset is settled, and the pipeline goes on with the next responses
 
 #### Scenario: Skip stanza unaffected
 
@@ -252,3 +270,103 @@ A stanza with `on_failure: retry` and a non-empty `response_topic` MUST name a t
 #### Scenario: Skip stanza with unlisted response topic
 - **WHEN** a stanza with `on_failure: skip` names a `response_topic` that no `producer:` entry lists
 - **THEN** startup is not aborted by this check
+
+### Requirement: Upstream response size limit
+
+The HTTP upstream MUST read at most 16 MiB of a response body, the same limit the gRPC upstream applies. A response body larger than that MUST fail the call as a non-retryable upstream failure (see "Non-retryable upstream failures"): it is recorded as failure and settled under every `on_failure` policy, and it MUST NOT be buffered beyond the limit.
+
+#### Scenario: Response over the limit
+
+- **WHEN** an HTTP upstream answers with a 20 MiB body
+- **THEN** the call fails, at most 16 MiB plus one byte of the body is read, the failure is recorded and the offset is settled without a retry
+
+#### Scenario: Response within the limit
+
+- **WHEN** an HTTP upstream answers with a 2 MiB body
+- **THEN** the body is read in full and handled like any other response
+
+### Requirement: Settlement across session end
+
+When a consumer group session ends (shutdown or rebalance), the system MUST NOT let the session's final offset commit happen before the records handed out by that session have settled or been abandoned, waiting at most `min(drain window, consumer.group.rebalance.timeout)`. A record settled within that wait MUST be committed and MUST NOT be redelivered. A record whose session has ended and that has not been dispatched to the upstream yet MUST NOT be dispatched: it MUST be left unsettled without an upstream call, so it is redelivered without a duplicate side effect. A response publication repeated under `on_failure: retry` MUST stop without settling once its record's session has ended. During shutdown, waiting for in-flight upstream calls MUST take at most one drain window in total.
+
+#### Scenario: Call finishes within the drain window on shutdown
+
+- **WHEN** a termination signal arrives while an upstream call is in flight and the call finishes (and its response is published) within the drain window
+- **THEN** its offset is committed before the session is released, and the record is not redelivered after restart
+
+#### Scenario: Buffered records of a revoked partition
+
+- **WHEN** a rebalance ends the session while records of that session are buffered and not yet dispatched
+- **THEN** none of them is sent to the upstream, none is settled, and they are redelivered to the partition's next owner
+
+#### Scenario: In-flight call during a rebalance
+
+- **WHEN** a rebalance ends the session while an upstream call of that session is in flight and finishes within the wait bound
+- **THEN** its offset is committed before the session is released, and the next owner does not receive the record again
+
+#### Scenario: Wait bound elapses
+
+- **WHEN** an in-flight call of an ended session does not finish within the wait bound
+- **THEN** the session is released without its mark, and the record is redelivered
+
+#### Scenario: Retried publication of an ended session
+
+- **WHEN** a retry stanza's response is being republished and its record's session ends
+- **THEN** the republication stops, the offset is not settled, and the record is redelivered
+
+### Requirement: Stanzas without topics are not started
+
+A consumer stanza without topics MUST be treated as disabled: the system MUST NOT create a Kafka client or a subscription for it, and MUST log one informational line naming the stanza at startup. It MUST NOT produce repeated errors while the process runs.
+
+#### Scenario: Disabled stanza
+
+- **WHEN** the configuration contains a consumer stanza with an empty `topics` list next to an active one
+- **THEN** only the active stanza gets a Kafka client and a subscription, one info line names the disabled stanza, and no "no topics provided" error is ever logged
+
+### Requirement: Non-retryable upstream failures
+
+A call failure that depends only on the record or on its response MUST be recorded as failure and settled after one attempt, under every `on_failure` policy, and MUST NOT count toward the poison detector. These failures are an HTTP response body over the upstream response size limit, and a required header that is missing or invalid for the transport (see `tracking-enrichment`). Every other call failure keeps its `on_failure` handling.
+
+#### Scenario: Oversized response on a sequential retry pipeline
+
+- **WHEN** a stanza with `on_failure: retry` and `max_conn: 1` calls an HTTP upstream that answers one record with a 20 MiB body
+- **THEN** the call is made once, the failure is recorded and logged with the request id, the offset is settled, and the next record of the partition is processed
+
+#### Scenario: Invalid required header on a retry pipeline
+
+- **WHEN** a header is listed as required, a consumed record carries it with a value containing a line feed, and the stanza sets `on_failure: retry`
+- **THEN** the upstream is not called, the failure is recorded and logged with the request id and the header name, and the offset is settled
+
+#### Scenario: Skip stanza
+
+- **WHEN** a stanza with `on_failure: skip` receives a 20 MiB HTTP response
+- **THEN** the failure is recorded once and the offset is settled, as before
+
+#### Scenario: Network failures are still retried
+
+- **WHEN** a stanza with `on_failure: retry` cannot connect to its upstream, or the call times out
+- **THEN** the call is retried as described in "Retry until the upstream recovers"
+
+### Requirement: HTTP upstream address validated at startup
+
+For an active stanza with `service.protocol: http`, startup MUST fail with an error naming the stanza unless `service.name` contains no whitespace or control characters, `service.port` is a decimal number from 1 to 65535, `service.path` starts with `/`, and the URL built from them forms a valid HTTP request. The check MUST NOT resolve or contact the host. Stanzas without topics MUST NOT be checked.
+
+#### Scenario: Invalid port
+
+- **WHEN** an `http` stanza with topics has `service.port` set to `abc`, `0` or `70000`
+- **THEN** startup fails with an error naming the stanza and the port
+
+#### Scenario: Path without a leading slash
+
+- **WHEN** an `http` stanza with topics has `service.path: predict`
+- **THEN** startup fails with an error naming the stanza and the path
+
+#### Scenario: Unreachable host
+
+- **WHEN** an `http` stanza has `service.name: model-svc`, `service.port: 8080` and the host does not resolve
+- **THEN** startup succeeds and each record fails as a transport failure until the service is reachable
+
+#### Scenario: Defaults are valid
+
+- **WHEN** an `http` stanza sets only `service.name`
+- **THEN** the default port and path pass the check

@@ -13,6 +13,16 @@ go build -o bridge-kafka-service ./cmd/bridge-kafka-service
 ./bridge-kafka-service --config examples/config_local_http.yaml
 ~~~
 
+Check a configuration without starting the service (for example in a deploy pipeline, before the rollout):
+
+~~~bash
+./bridge-kafka-service --check-config --config examples/config_local_http.yaml
+# configuration examples/config_local_http.yaml is valid      (stdout, exit code 0)
+# error: invalid consumer topology: response topics form a cycle ...   (stderr, exit code 1)
+~~~
+
+`--check-config` loads the file and runs exactly the checks startup runs, including the TLS and Kafka tuning files, so run it where those files are (the target image, the same working directory). It prints every warning and every error, one per line, connects to nothing and writes no log or metric files. **Before upgrading, run it with the new binary against each deployed configuration**: newer releases reject mistakes older ones let through.
+
 The whole stand in Docker Compose, with a check of the chain Kafka → service → Kafka (the upstream service is wired in a local `compose.override.yaml`; see "Local stand"):
 
 ~~~bash
@@ -263,6 +273,8 @@ The application config is one YAML file: the `--config` flag, then `CONFIG_PATH`
 * an unknown key (a typo such as `maxopenrequest`, or a key in the wrong case such as `MaxOpenRequests`) is logged as a warning (`unknown tuning key net.maxopenrequest in configs/config_producer.yaml is ignored`) and ignored, so the sarama default stays;
 * a sarama setting that cannot be expressed in YAML (callbacks and plug-ins such as `producer.partitioner` or `net.sasl.tokenprovider`) is logged as a warning and ignored.
 
+A record is published only if it fits `producer.maxmessagebytes` in the producer file (1 MiB by default, keep it in line with the broker's `message.max.bytes`).
+
 Consumer group defaults set by the bridge, which the consumer file overrides:
 
 | Key | Default |
@@ -284,10 +296,12 @@ http.addr: 0.0.0.0:8081                 # publish API and probes
 pprof.addr: ""                          # profiling address; empty (default) disables it, keep it on 127.0.0.1
 audit.grpc_endpoint: ""                 # Envoy ALS receiver; audit is always written to <metrics file>.audit too
 timeouts.shutdown: 10s                  # on SIGTERM: drain of HTTP requests and active service calls
+retention.max_backups: 0                # backups kept per metric/audit file; 0 (default) keeps all
+retention.max_age_days: 0               # delete backups older than this many days; 0 (default) never
 
 kafka:
   brokers: kafka:29092,kafka2:29093     # a comma-separated string or a list
-  version: 2.3.0                        # with consumers: at least 0.10.2 (0.x written as 0.10.2.0), else startup fails
+  version: 2.3.0                        # at least 0.10.2 with consumers, 0.11 with producers (0.x written as 0.11.0.0), else startup fails; empty = 2.7.0, a value that does not parse stops startup
 kafka.tls.client.cert.path: certs/client_cert.pem
 kafka.tls.client.key.path: certs/client_key.pem
 kafka.tls.ca.path: certs/cacert.pem
@@ -339,7 +353,7 @@ LOG_FILE_NAME: run log file name (environment only)
 
 Each consumer has:
 
-* topics: topics to consume
+* topics: topics to consume (a stanza with no topics is disabled: it gets no Kafka client and is not counted in readiness)
 
 * group: Kafka consumer group
 
@@ -349,9 +363,9 @@ Each consumer has:
 
 * name: service name
 
-* port: service port (`protocol: grpc`: a number from 1 to 65535, otherwise startup fails)
+* port: service port, a number from 1 to 65535, otherwise startup fails
 
-* path: API path (`protocol: http` only)
+* path: API path (`protocol: http` only); it must start with `/`, otherwise startup fails
 
 * protocol: `http` (default) or `grpc`
 
@@ -365,6 +379,12 @@ Each consumer has:
 
 * on_failure: what to do when the service cannot be reached: `skip` (default) or `retry` (see below). With `retry`, a non-empty `response_topic` must be listed as a `producer:` topic: startup fails otherwise, because such a config would lose every response.
 
+How stanzas fit together is checked at startup as well (stanzas without topics are ignored):
+
+* **No response-topic cycle.** If response topics lead back into the stanzas' own input topics (`orders` → `orders`, or A reads `a` and answers to `b` while B reads `b` and answers to `a`), every response would be consumed again: startup fails and names the cycle. A chain without a cycle (A → `x` → B → `y`) is fine.
+* **No shared group and topic.** Two stanzas with the same `group` and a common topic would split that topic's partitions between them, so each record would reach whichever service owns its partition: startup fails. For more concurrency, use one stanza with a higher `service.max_conn`. The same `group` with different topics is allowed, with a warning that the stanzas rebalance together; the same topic in different groups is a normal fan-out.
+* **No empty entry.** A `consumer` or `producer` entry that is empty (`- ~`) stops startup with an error naming its position; to disable a consumer stanza, leave its `topics` empty.
+
 ### Service transport: HTTP or gRPC
 `service.protocol` selects how a record reaches the service. Everything else (timeout, offset settle, `x-request-id`/`x-client-id` propagation, response publishing, metrics, `max_conn` modes) is **identical** for both protocols.
 
@@ -377,7 +397,14 @@ Each consumer has:
 | response `data` | response body published to `response_topic` |
 | response header/trailer metadata | response record headers |
 
-gRPC statuses: `Unavailable`, `DeadlineExceeded`, `Canceled` (and connection errors) are transport failures, handled by `on_failure` (with `skip`: a failure metric, nothing published, the offset is settled). Any other non-OK status is **a service response**: a record with an empty body and `Grpc-Status`/`Grpc-Message` headers is published, and the event counts as successful (like HTTP 4xx/5xx). The message limit is 16 MiB (larger → `ResourceExhausted`). One connection per pipeline, established lazily: a service unavailable at startup does not block startup.
+gRPC statuses: `Unavailable`, `DeadlineExceeded`, `Canceled` (and connection errors) are transport failures, handled by `on_failure` (with `skip`: a failure metric, nothing published, the offset is settled). Any other non-OK status is **a service response**: a record with an empty body and `Grpc-Status`/`Grpc-Message` headers is published, and the event counts as successful (like HTTP 4xx/5xx). The call limit is 16 MiB (larger → `ResourceExhausted`); an HTTP service response is read up to the same 16 MiB, a larger one fails the call without a retry (see "Service failures"). Publishing the response has its own, smaller limit: see "Service failures". One connection per pipeline, established lazily: a service unavailable at startup does not block startup.
+
+**Record headers on the way to the service.** Every record header is forwarded, with these exceptions:
+
+* **Transport-controlled headers** never go into an HTTP call: the hop-by-hop headers (`Connection`, `Proxy-Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`), `Host`, `Content-Length` and `Content-Type`. They are left out without a warning (records published by another bridge carry them), and an HTTP call always has `Content-Type: application/json`: a record's own `Content-Type`, even a JSON subtype such as `application/vnd.api+json`, no longer overrides it. A gRPC call keeps gRPC's own content type; record headers, `Content-Type` included, travel in `details` as data.
+* **Headers the transport cannot carry** are left out of the call with a warning naming the header and the request id, and the record is processed. HTTP cannot carry an invalid header name or a value with a control character other than tab (a line feed, for example). gRPC cannot carry text that is not valid UTF-8, and sends an `x-request-id` that is not printable ASCII in `details` only, not as metadata. The record keeps the header for audit and for the response record. This changes `skip` stanzas too: such a record used to fail, now it gets a response.
+* **Tracking headers ignore letter case.** `X-Request-Id`, `X-Client-Id`, `X-Trace-Id` and `X-Request-Time` in a record are recognised in any case and forwarded under their lowercase names; if a record carries two spellings, the lowercase one wins.
+* **Required headers.** The code keeps a list of headers a record must carry (`consts.RequiredHeaders`), empty in this release; the tracking headers are the candidates. A record without a listed header, or with one the transport cannot carry, is not sent: it is a failure settled after one attempt (see "Service failures"). A listed header gets no default value.
 
 ### Service connection encryption (`service.tls`)
 Works the same for `http` (it becomes `https://`) and `grpc`. The section is optional: **without it (or without `mode`) the connection is not encrypted**, as before.
@@ -409,18 +436,22 @@ Shutdown: the pipeline waits up to `timeouts.shutdown` (default 10s) for active 
 ### Service failures (`on_failure`)
 A failure is only a transport failure: the service is unreachable, does not answer within `timeout`, or returns gRPC `Unavailable`/`DeadlineExceeded`/`Canceled`. Any HTTP status (4xx/5xx included) and any other gRPC status is a response and is published, never retried.
 
+Some failures depend only on the record or its response, so repeating the call cannot help: an HTTP response body over 16 MiB, and a required header that is missing or that the transport cannot carry (see "Record headers on the way to the service"). They are attempted once, recorded as a failure and settled under **both** policies, so they never stall a `retry` pipeline.
+
 | `on_failure` | On a failure |
 |---|---|
 | `skip` (default) | a failure metric, nothing published, the offset is settled; the record is not delivered again |
 | `retry` | the offset is held and the call repeated with backoff (1s doubling up to 30s) until the service answers; the record stays in Kafka meanwhile |
 
-`retry` requires `service.max_conn > 0`, otherwise startup fails. When all `max_conn` slots are retrying, the pipeline stops reading Kafka until the service recovers, so an outage loses nothing. Each failed attempt is logged as a warning; metrics count only the final outcome of a record.
+`retry` requires `service.max_conn > 0`, otherwise startup fails. When all `max_conn` slots are retrying, the pipeline stops reading Kafka until the service recovers, so an outage loses nothing. Each failed attempt is logged as a warning with the attempt number and `failing_for`, how long the record has been failing; metrics count only the final outcome of a record. `GET /status` shows, per pipeline, how many records are retrying and how old the oldest retry is (see "Probes").
 
-With `retry` a response is never dropped either: when the pipeline's publish queue (1000 responses) is full because Kafka writes are slow, the call waits for space instead of dropping the response and settling the offset (`skip` drops it with a warning). And when Kafka rejects the write itself, the response is republished with the same backoff (1s doubling up to 30s) until the broker accepts it: the offset is held and the upstream is not called again, so a broker outage stalls `retry` pipelines instead of losing their responses. Each pipeline has its own publish queue and writes up to 16 responses at once (`max_conn` if lower, so a `max_conn: 1` pipeline writes one at a time, in order), so a response topic that is broken or slow holds back only the pipeline that writes to it, never the others. Each failed attempt is logged as a warning; metrics and audit record only the final outcome. The exception is a non-transient publish error (for example, a record too large for the broker): it is recorded as a failure and the offset is settled, like a poison record. On shutdown the backoff wait ends and an unpublished response is not settled, so its record is redelivered after restart.
+With `retry` a response is never dropped either: when the pipeline's publish queue (1000 responses) is full because Kafka writes are slow, the call waits for space instead of dropping the response and settling the offset (`skip` drops it with a warning and counts it as a failed publication in `controller_kafka_response_service_failure_total`, with its egress audit entry). And when Kafka rejects the write itself, the response is republished with the same backoff (1s doubling up to 30s) until the broker accepts it: the offset is held and the upstream is not called again, so a broker outage stalls `retry` pipelines instead of losing their responses. Each pipeline has its own publish queue and writes up to 16 responses at once (`max_conn` if lower, so a `max_conn: 1` pipeline writes one at a time, in order), so a response topic that is broken or slow holds back only the pipeline that writes to it, never the others. Each failed attempt is logged as a warning; metrics and audit record only the final outcome. The exception is a non-transient publish error: a response larger than `producer.maxmessagebytes` (1 MiB by default; the broker's `message.max.bytes` applies as well), a record the broker rejects as invalid, or a feature the configured Kafka version lacks. It is attempted once, recorded as a failure and the offset is settled, like a poison record. To publish larger responses, raise `producer.maxmessagebytes` in `config_producer.yaml` together with the broker and topic limits. On shutdown the backoff wait ends and an unpublished response is not settled, so its record is redelivered after restart.
 
-A record that fails 5 attempts **while other records of the same pipeline get answers** is treated as poison: a failure metric, a `poison` warning with its request id, the offset is settled. During an outage nothing is skipped. With `max_conn: 1` there are no other calls to compare with, so such a record is retried until the service answers.
+A record that fails 5 attempts **while other records of the same pipeline get answers** is treated as poison: a failure metric, a `poison` warning with its request id, the offset is settled. During an outage nothing is skipped. With `max_conn: 1` there are no other calls to compare with, so such a record is retried until the service answers; failures that depend only on the record (above) are not retried at all, so only network failures, such as a timeout on one heavy payload, can hold a `max_conn: 1` pipeline this way, and `/status` shows it.
 
 Records are delivered at least once: with `retry`, records consumed after a retrying one are processed but not committed past it, so a restart or rebalance delivers them again. The service should be idempotent on `x-request-id`.
+
+On a rebalance, a partition that moves to another instance is handed over cleanly: its records that are buffered but not yet sent to the service are not sent (the new owner gets them), retries for its records stop, and its in-flight calls get up to `timeouts.shutdown` (capped by `consumer.group.rebalance.timeout`, 60s by default) to finish and be committed before the partition is released. Only calls still running after that are delivered again.
 
 ## Logs and metrics
 
@@ -434,6 +465,8 @@ The app tracks four metric types per operation:
 * Requests Total: all attempts
 
 * Duration Milliseconds: operation duration, from the start of *that* event to its close (independent of concurrent requests, excluding time in the metrics queue; an event without a start yields 0)
+
+A response dropped from a full publish queue under `on_failure: skip` counts as a `response_service` failure. Earlier releases showed such drops only in the logs, so the metric may rise after an upgrade on pipelines whose queue saturates.
 
 ### Logging
 * Structured logging with Zerolog
@@ -457,8 +490,22 @@ Log levels:
 | Path | Purpose | Response |
 |---|---|---|
 | `GET /healthz` (and the former `/health`) | liveness: the process is running; does not depend on Kafka | `200 {"status":"running"}` |
-| `GET /readyz` | readiness: the producer is connected (when producers are configured) and every consumer is running | `200 {"status":"ready"}` / `503 {"status":"not ready","reasons":[...]}` |
-| `GET /status` | details for humans | `200 {"ready":..., "producer_ready":..., "consumers_up":..., "consumers_total":...}` |
+| `GET /readyz` | readiness: the producer is connected (when producers are configured) and the consumer of every stanza with topics is running | `200 {"status":"ready"}` / `503 {"status":"not ready","reasons":[...]}` |
+| `GET /status` | details for humans (`consumers_total` counts stanzas with topics) | `200 {"ready":..., "producer_ready":..., "consumers_up":..., "consumers_total":..., "pipelines":[...]}` |
+
+`pipelines` has one entry per stanza with topics, in configuration order. Readiness does not depend on it:
+
+~~~json
+{"group":"bridge-group","topics":["bridge.requests.1"],
+ "retrying_calls":1,"retrying_publications":0,"oldest_retry_seconds":180,"uncommitted":41,"paused":false}
+~~~
+
+* `retrying_calls`: records retrying their call to the service; `retrying_publications`: responses retrying their write to the response topic (`on_failure: retry`)
+* `oldest_retry_seconds`: age of the oldest of those since its first failed attempt, `0` when none
+* `uncommitted`: records handed out by the current claims and not yet committed, including those processed but held behind an earlier record (they are delivered again after a restart)
+* `paused`: whether consumption is paused by `SIGUSR1` (one state for the whole process)
+
+**No authentication.** `POST /api/v1/publish` and the probes on `http.addr` accept any client that can reach the port: a client can publish to every topic listed under `producer:`. Expose `http.addr` only to trusted clients (bind address, network policy, or an authenticating gateway in front). The listener closes a connection whose request is not fully received within 30 seconds or that stays idle for 120 seconds; a publish that waits for Kafka is never cut off while it answers.
 
 Profiling (`net/http/pprof`) is never served on this port: it runs only on `pprof.addr` (off by default); a non-loopback `pprof.addr` is logged as a warning.
 
@@ -539,10 +586,11 @@ template:
 ### Startup, shutdown and signals
 
 * **The HTTP server and `/health` start immediately**, without waiting for Kafka. The producer and consumers connect in the background with exponential backoff (up to 5 minutes). Until the producer connects, `POST /api/v1/publish` returns `503`; consumers start reading only once the producer is ready or permanently unavailable.
-* If a consumer client cannot be created within 5 minutes, the process **exits with code 1** (so the orchestrator restarts it) instead of idling. The same happens when the producer cannot be created within 5 minutes **and at least one consumer stanza has a `response_topic`**: no consumer reads a record whose response could not be published. A deployment where no stanza has a `response_topic` keeps running with consumption only, as before.
-* If a subscription cannot start after its client was created (the service connection cannot be set up, the consumer group cannot be created), the process also **exits with code 1**, and the error names the stanza's topics; it never keeps running while reporting ready without reading. The configuration causes of this are rejected at startup instead: `kafka.version` below 0.10.2 with active consumers, an invalid `service.name`/`service.port` of a gRPC stanza.
-* `SIGTERM` / `SIGINT`: graceful shutdown. HTTP intake and Kafka reading stop, the metrics and audit queues are flushed, the producer and files are closed. Records not processed in time are not committed and will be redelivered (at-least-once).
-* `SIGUSR1` toggles pause/resume of reading **for all** consumers of the process.
+* If a consumer client cannot be created within 5 minutes, the process **exits with code 1** (so the orchestrator restarts it) instead of idling. The same happens when the producer cannot be created within 5 minutes, **whenever producers are configured**: no consumer reads a record first. Earlier releases kept a deployment without any `response_topic` consuming in that case, with `/readyz` answering 503 forever; such a process now restarts. A consumption-only deployment that does not publish should list no `producer:` entries.
+* If a subscription cannot start after its client was created (the service connection cannot be set up, the consumer group cannot be created), the process also **exits with code 1**, and the error names the stanza's topics; it never keeps running while reporting ready without reading. The configuration causes of this are rejected at startup instead: `kafka.version` below 0.10.2 with active consumers, an invalid `service.name`/`service.port` of any stanza, an HTTP `service.path` that does not start with `/`.
+* **Configuration errors are reported together.** Startup runs every check (Kafka setup, service settings, how stanzas fit together, Kafka tuning files) before stopping, so one run lists every problem, each with its stanza and rule. Only a file that cannot be parsed at all stops at the first error. `--check-config` runs the same checks without starting (see "Run").
+* `SIGTERM` / `SIGINT`: graceful shutdown. HTTP intake and Kafka reading stop; in-flight upstream calls get up to `timeouts.shutdown` in total to finish, and every record that finishes in that time is committed before the consumer group session is released, so it is not redelivered. Records still unfinished after it, and buffered records not yet sent to the service, are not committed and will be redelivered (at-least-once). Then the metrics and audit queues are flushed and the producer and files are closed.
+* `SIGUSR1` toggles pause/resume of reading **for all** consumers of the process. The pause is one state of the process: a partition the process receives while paused (after a rebalance, for example) is paused as soon as its claim starts, and records Kafka has already delivered are held, not sent to the service, until the next `SIGUSR1`. Records already sent finish as usual. `GET /status` shows `paused` for every pipeline.
 
 Kubernetes/OpenShift probe example:
 ~~~yaml
@@ -619,7 +667,9 @@ x-kafka-key: partitioning key (optional)
 
 x-bridge-kafka-header-<name>: becomes Kafka header <Name> (the prefix is dropped)
 ~~~
-Response codes: `422` missing topic header / invalid body (including more than one JSON value), `415` Content-Type is not `application/json`, `503` the producer is not configured or not connected yet.
+A header listed as required (`consts.RequiredHeaders`, empty in this release) must be present, and is carried onto the record under its lowercase name.
+
+Response codes: `422` missing topic header / missing required header / invalid body (including more than one JSON value), `415` Content-Type is not `application/json`, `503` the producer is not configured or not connected yet.
 
 Request body:
 ~~~
@@ -752,7 +802,13 @@ If a certificate file is missing or `mtls` has no key, the bridge **does not sta
 If the server requires a client certificate but the bridge config says `tls` or `none`, the handshake fails: a transport failure (log: `Send to service ... status: failure`), nothing is written to the output topic, and with `on_failure: skip` the offset is settled, so the record does not block the partition (with `retry` it is retried until the config is fixed or it is skipped as poison).
 
 ### Audit sink (Envoy ALS)
-Any Envoy ALS v3 receiver works as a sink: point `audit.grpc_endpoint` at it (in the stand config: `audit-grpc-svc:50053`; on the host: `127.0.0.1:50053`). Audit is **always** written to `app-metrics.log.audit` next to the metrics (JSON lines), even when the sink is unavailable.
+Any Envoy ALS v3 receiver works as a sink: point `audit.grpc_endpoint` at it (in the stand config: `audit-grpc-svc:50053`; on the host: `127.0.0.1:50053`). Audit is **always** written to `app-metrics.log.audit` next to the metrics (JSON lines), even when the sink is unavailable:
+
+* **The audit file is complete** for the backups the service keeps (all of them by default). No entry is ever dropped from it; entries are written in order and flushed to disk at least once a second (and whenever the service is idle), so a machine crash loses at most the last second.
+* **ALS delivery is best-effort and never slows the service.** Entries are sent after they are in the file, in batches over one stream per batch. If the receiver is slow or down and its queue fills, entries are skipped for ALS only, and a warning reports how many (`N audit entries were not delivered to the ALS endpoint (the audit file has them)`, at most once a minute). On shutdown the remaining entries get one attempt of at most 3 seconds.
+* **Rotation.** `app-metrics.log` and `app-metrics.log.audit` rotate at 100 MB into compressed backups next to them (`app-metrics-<time>.log.gz`, `app-metrics.log-<time>.audit.gz`).
+* **Retention.** By default the service never deletes a backup, so nothing is lost, and cleaning up is the operator's job (a log shipper that removes what it has collected, or a cron job): without it the disk keeps filling. To let the service bound it, set `retention.max_backups` (keep at most N backups of each file) and/or `retention.max_age_days` (delete backups older than N days). Backups beyond the limits are deleted when the file is first written after a start and at every rotation; the current files are never deleted, so with `retention.max_backups: N` each file takes at most about `(N + 1) × 100 MB`. A non-zero limit is stated in one log line at startup, because audit entries in deleted backups are gone.
+* **Permissions.** Both files and their backups are readable and writable by the service user only (`0600`); the audit holds full request and response bodies. Files created by earlier versions are switched to `0600` at startup.
 
 ### What to look for in metrics and logs
 ~~~bash
@@ -772,6 +828,7 @@ TLS configuration
 
 ### Header security
 * Binary headers are base64-encoded automatically
+* Transport-controlled headers of a record (hop-by-hop, `Host`, `Content-Length`, `Content-Type`) never reach an HTTP service, and values a transport cannot carry are left out with a warning
 * Request-ID validation and generation
 * System identifier check
 
