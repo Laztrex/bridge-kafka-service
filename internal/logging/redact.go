@@ -7,8 +7,8 @@ import (
 	"sync"
 )
 
-// Secret masking shared by the Go services (docs/conventions.md, section 6): registered values
-// are replaced with secretMask in everything written through Redacting, including their
+// Secret masking shared by the Go services (platform spec core/platform-logging): registered
+// values are replaced with secretMask in everything written through Redacting, including their
 // JSON-escaped form. Keep this file identical across repositories.
 
 const secretMask = "***"

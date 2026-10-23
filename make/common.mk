@@ -1,4 +1,4 @@
-# Shared Makefile part of the Go services (docs/conventions.md, section 11).
+# Shared Makefile part of the Go services (platform spec core/platform-build-interface).
 # Keep this file identical across repositories. The including Makefile defines, before the include:
 #   APP              binary and image name (= repository name)
 #   CMD              main package, e.g. ./cmd/<name>

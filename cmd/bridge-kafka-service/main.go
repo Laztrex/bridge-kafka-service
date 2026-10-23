@@ -90,10 +90,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		log.Error().Err(err).Msg("unable to load the config")
 		return 1
 	}
-	logging.SetLevel(cfg.LogLevel)
-	for _, key := range cfg.Warnings {
-		log.Warn().Msgf("unknown config key %q is ignored", key)
+	// The deprecation warnings are logged before the configured level applies, so they are
+	// visible whatever log.level says.
+	for _, d := range cfg.Deprecations {
+		log.Warn().Msg(d)
 	}
+	logging.SetLevel(cfg.LogLevel)
 	codec.SetSystemID(cfg.SystemID)
 
 	log.Info().
@@ -116,6 +118,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 // checkConfig loads the configuration and runs exactly the checks startup runs, without setting up
 // logging, connecting anywhere or writing files. Warnings and errors go to stderr, one per line,
 // and the verdict to stdout; it returns 0 when the configuration is valid and 1 otherwise.
+// A file that parsed but is invalid still has its remaining checks run, so every problem is
+// reported in one pass.
 func checkConfig(flagPath string, stdout, stderr io.Writer) int {
 	path, usedDefault := config.ResolvePath(flagPath, os.Getenv)
 	if usedDefault {
@@ -123,20 +127,26 @@ func checkConfig(flagPath string, stdout, stderr io.Writer) int {
 	}
 	cfg, err := config.Load(path, os.Getenv)
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
-		return 1
-	}
-	for _, key := range cfg.Warnings {
-		_, _ = fmt.Fprintf(stderr, "warning: unknown config key %q is ignored\n", key)
-	}
-	warnings, err := app.Check(cfg)
-	for _, w := range warnings {
-		_, _ = fmt.Fprintf(stderr, "warning: %s\n", w)
-	}
-	if err != nil {
 		for _, line := range strings.Split(err.Error(), "\n") {
 			_, _ = fmt.Fprintf(stderr, "error: %s\n", line)
 		}
+	}
+	if cfg != nil {
+		for _, d := range cfg.Deprecations {
+			_, _ = fmt.Fprintf(stderr, "warning: %s\n", d)
+		}
+		warnings, checkErr := app.Check(cfg)
+		for _, w := range warnings {
+			_, _ = fmt.Fprintf(stderr, "warning: %s\n", w)
+		}
+		if checkErr != nil {
+			err = errors.Join(err, checkErr)
+			for _, line := range strings.Split(checkErr.Error(), "\n") {
+				_, _ = fmt.Fprintf(stderr, "error: %s\n", line)
+			}
+		}
+	}
+	if err != nil {
 		return 1
 	}
 	_, _ = fmt.Fprintf(stdout, "configuration %s is valid\n", path)

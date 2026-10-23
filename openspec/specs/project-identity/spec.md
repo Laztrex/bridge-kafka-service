@@ -6,21 +6,26 @@ Fixes the canonical name of the service and enumerates the legacy wire-level ide
 ## Requirements
 
 ### Requirement: Canonical project name
-The Go module, the `cmd/` entrypoint directory, the binary, the Docker `APP_NAME` and the cobra command `Use` MUST all be `bridge-kafka-service`. The names `provider_kafka` and `provider-kafka` MUST NOT appear in source, build files or configs; the only permitted mention is the historical note in the README.
+The Go module, the `cmd/` entrypoint directory, the binary, the Docker `APP_NAME` and the standard-library flag set name MUST all be `bridge-kafka-service`. The names `provider_kafka` and `provider-kafka` MUST NOT appear in source, build files or configs; the only permitted mention is the historical note in the README.
 
 #### Scenario: Build from clean checkout
 - **WHEN** `go build ./cmd/bridge-kafka-service` runs on a fresh clone
 - **THEN** it produces the `bridge-kafka-service` binary and no import path references the old name
 
 ### Requirement: Legacy wire identifiers are frozen
-The following external identifiers MUST keep their legacy `controller-kafka` form until an explicit migration change replaces them:
+The following external identifiers MUST keep their legacy form until an explicit migration change replaces them:
 - HTTP headers `x-bridge-kafka-produce-topic` and the custom prefix `x-bridge-kafka-header-`;
-- metric names `controller_kafka_<event>_*`;
 - ALS `UpstreamCluster = "kafka-controller-cluster"` and fallback `ForwardedFor = "controller-kafka"`.
+
+Metric names are not frozen: they carry the service prefix `bridge_kafka_service_` (spec observability-audit).
 
 #### Scenario: Caller built against the old name
 - **WHEN** a client publishes with `x-bridge-kafka-produce-topic`
 - **THEN** the request is accepted exactly as before the rename
+
+#### Scenario: Metric name
+- **WHEN** a record is consumed
+- **THEN** its metric lines are named `bridge_kafka_service_consume_*`, and no line starts with `controller_kafka_`
 
 ### Requirement: Tracking header names
 System tracking headers MUST be `x-request-id`, `x-request-time`, `x-trace-id`, `x-client-id`, plus optional `x-kafka-key` (partition key). Specs that say `Request-Id`, `Trace-Id`, `Client-Id` refer to these.

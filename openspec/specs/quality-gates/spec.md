@@ -23,34 +23,23 @@ Code that reads wall-clock time for latency MUST do so through the logger's cloc
 - **WHEN** two events are started and closed in interleaved order while the fake clock advances between steps
 - **THEN** each event's duration equals its own span as computed from the fake clock
 
-### Requirement: Coverage gate
-`make coverage-check` MUST fail when statement coverage is below `COVER_THRESHOLD`, whose default is **80**. Generated `*.pb.go` files, the test helper trees `testutil/` and `test/`, and the command entrypoint `cmd/` MUST be the only exclusions and MUST be listed in `docs/coverage.md`. In addition, no non-excluded package MAY fall below a per-package floor of 60%. `docs/coverage.md` documents the CI job.
-
-#### Scenario: Below threshold
-- **WHEN** measured coverage is under the threshold
-- **THEN** `scripts/coverage.sh` exits non-zero and prints per-package coverage
-
-#### Scenario: Package below floor
-- **WHEN** total coverage meets the threshold but one non-excluded package is under 60%
-- **THEN** the gate fails and names that package
-
-#### Scenario: Threshold override
-- **WHEN** `COVER_THRESHOLD=50 make coverage-check` is run
-- **THEN** the gate compares against 50
-
 ### Requirement: Single entrypoint for local checks
-`make ci` MUST run the gofmt check, `go vet`, the race-enabled tests, golangci-lint, govulncheck, the coverage gate and `proto-check` in one command, and CI MUST call the same target so local runs equal CI. `make check` remains as `make build ci`.
+Besides the platform checks, `make ci` MUST run the project checks `proto-check` and `docs-check`. `make check` remains as `make build ci`.
 
 #### Scenario: Clean tree
 - **WHEN** `make ci` (or `make check`) runs on a healthy checkout
 - **THEN** it exits 0
 
+#### Scenario: Stale generated code fails the entrypoint
+- **WHEN** `service.proto` changed without `make proto` and `make ci` runs
+- **THEN** it fails in `proto-check`
+
 ### Requirement: Lifecycle behaviour is tested end to end
-Startup and shutdown behaviour of `app.Connect` MUST be covered by tests that need no live broker: HTTP available while Kafka is unreachable, graceful return on context cancellation, and non-nil error on permanent consumer failure.
+Startup and shutdown behaviour of `app.Connect` MUST be covered by tests that need no live broker: HTTP available while Kafka is unreachable, the service staying up and not ready while the broker is unreachable, probes answering during the shutdown drain, and graceful return on context cancellation.
 
 #### Scenario: Unreachable broker
-- **WHEN** the test points Connect at a closed local port with a short retry window
-- **THEN** it returns the consumer failure error within seconds
+- **WHEN** the test points Connect at a closed local port
+- **THEN** Connect keeps running, `/healthz` answers 200 and `/readyz` answers 503, and it returns nil after the context is cancelled
 
 ### Requirement: Regression tests for fixed defects
 Every defect fixed in request validation, payload coercion, offset settlement or shutdown ordering MUST be accompanied by a test that fails without the fix.
@@ -58,17 +47,6 @@ Every defect fixed in request validation, payload coercion, offset settlement or
 #### Scenario: Trailing JSON value
 - **WHEN** the request-id middleware test posts two concatenated JSON objects
 - **THEN** it expects 422 and the downstream handler not called
-
-### Requirement: Pinned toolchain
-The Go toolchain version MUST be identical across `go.mod`, every Dockerfile that compiles Go code, and the CI snippet: **1.27.2**. Container builders use the `golang:1.27.2` image (also the CI checks image by default).
-
-#### Scenario: Image build
-- **WHEN** any Dockerfile in the repository is built
-- **THEN** it uses a Go 1.27.2 builder image and the module compiles without toolchain download
-
-#### Scenario: Toolchain drift
-- **WHEN** `go.mod` declares a Go version newer than the builder images
-- **THEN** the change is rejected in review because builds would fail or silently download a different toolchain
 
 ### Requirement: Broker-free tests for the consume and produce paths
 The consume loop, claim handling, consumer/producer client construction and the gRPC audit delivery path MUST be testable without a live Kafka broker or external gRPC service, through injectable factories and a loopback gRPC server.

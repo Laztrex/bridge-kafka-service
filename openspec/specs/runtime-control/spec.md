@@ -6,11 +6,15 @@ Lets operators stop the process cleanly and pause or resume Kafka consumption on
 ## Requirements
 
 ### Requirement: Graceful termination on standard signals
-The system MUST treat both `SIGINT` and `SIGTERM` as a request to shut down gracefully by cancelling a single root context. Shutdown MUST proceed in this order: stop accepting HTTP requests (bounded drain of 10 seconds) and stop claiming Kafka records; wait for every pipeline to terminate; publish responses already queued; close the shared producer exactly once; flush and close metric and audit sinks. Records not fully processed are not committed and are redelivered after restart.
+The system MUST treat both `SIGINT` and `SIGTERM` as a request to shut down gracefully by cancelling a single root context. Shutdown MUST proceed in this order: mark the service as draining, so that publish requests answer 503 and `/readyz` reports `shutting down` while `/health`, `/healthz` and `/status` keep answering; stop claiming Kafka records and wait for in-flight publish requests; wait for every pipeline to terminate; publish responses already queued; close the shared producer exactly once; flush and close metric and audit sinks; shut down the HTTP server last. The whole sequence is bounded by `timeouts.shutdown`. Records not fully processed are not committed and are redelivered after restart.
 
 #### Scenario: SIGTERM mid-run
 - **WHEN** an operator sends `SIGTERM` while messages are being consumed and forwarded
 - **THEN** no new records are claimed, queued metric and audit events are written to their files, the producer and consumer clients are closed, all goroutines started by the pipelines return and the process exits with status 0
+
+#### Scenario: Probes during the drain
+- **WHEN** `SIGTERM` arrives while an upstream call is in progress
+- **THEN** until that call finishes, `GET /healthz` answers 200, `GET /readyz` answers 503 with `shutting down`, and a new publish request answers 503
 
 #### Scenario: Events submitted after shutdown
 - **WHEN** a straggler goroutine records an event after the sinks were closed
@@ -22,14 +26,14 @@ The system MUST treat both `SIGINT` and `SIGTERM` as a request to shut down grac
 
 ### Requirement: Fail fast on permanent consumer failure
 
-The process MUST fail fast on any permanent inability to consume. If a consumer client cannot be created within the retry window (default five minutes of exponential back-off), or if a subscription cannot start because its upstream cannot be constructed or its consumer group cannot be created, the process MUST shut down gracefully and exit with a non-zero status instead of staying alive without consuming, so a supervisor can restart it. The terminating error MUST name the affected topics.
+The process MUST fail fast when a subscription cannot start for a reason that retrying cannot fix: its upstream cannot be constructed, or its consumer group cannot be created from a connected client. It MUST then shut down gracefully and exit with a non-zero status, and the terminating error MUST name the affected topics. An unreachable broker is not such a reason: producer and consumer clients MUST keep retrying with exponential backoff and jitter until shutdown, while the service stays up and `/readyz` names the clients that are not connected.
 
-Once a subscription has started, transient errors from the consume loop MUST NOT terminate the process (see "Consumer-loop resilience during transient errors"); only the inability to start consuming is permanent.
+Once a subscription has started, transient errors from the consume loop MUST NOT terminate the process (see "Consumer-loop resilience during transient errors").
 
 #### Scenario: Brokers unreachable beyond the retry window
 
-- **WHEN** consumer client creation keeps failing until the retry window elapses
-- **THEN** `Connect` returns an error naming the affected topics and the process exits with status 1
+- **WHEN** consumer client creation keeps failing for longer than five minutes
+- **THEN** the process stays up, `/healthz` answers 200, `/readyz` answers 503 naming the consumer, and the client is created once the broker is reachable
 
 #### Scenario: Cancellation interrupts retries
 

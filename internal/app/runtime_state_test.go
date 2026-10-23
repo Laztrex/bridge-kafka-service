@@ -41,7 +41,7 @@ func TestReadinessFollowsProducerAndConsumers(t *testing.T) {
 		Consumers: []*schemas.ConsumerConfig{{Topics: []string{"in"}}},
 	}
 	reg := router.NewProducerRegistry()
-	ready := newReadiness(reg, cfg)
+	ready := newRuntimeState(reg, cfg)
 	srv := server(t, cfg, reg)
 	srv.Handler = newHTTPServer(nil, reg, cfg, ready, "127.0.0.1:0").Handler
 
@@ -70,7 +70,7 @@ func TestReadinessFollowsProducerAndConsumers(t *testing.T) {
 
 // Without producers in the config, readiness does not wait for one.
 func TestReadinessWithoutProducers(t *testing.T) {
-	r := newReadiness(router.NewProducerRegistry(), &schemas.KafkaInfo{})
+	r := newRuntimeState(router.NewProducerRegistry(), &schemas.KafkaInfo{})
 	if reasons := r.reasons(); len(reasons) != 0 {
 		t.Fatalf("want ready, got %v", reasons)
 	}
@@ -89,7 +89,7 @@ func TestReadinessCountsOnlyActiveStanzas(t *testing.T) {
 	cfg := &schemas.KafkaInfo{Consumers: []*schemas.ConsumerConfig{
 		{Topics: []string{"a"}}, {Topics: []string{"b"}}, {Topics: nil}, nil,
 	}}
-	r := newReadiness(router.NewProducerRegistry(), cfg)
+	r := newRuntimeState(router.NewProducerRegistry(), cfg)
 	if r.consumersTotal != 2 {
 		t.Fatalf("consumers_total = %d, want 2", r.consumersTotal)
 	}
@@ -100,7 +100,7 @@ func TestReadinessCountsOnlyActiveStanzas(t *testing.T) {
 	}
 }
 
-func status(t *testing.T, r *readiness) statusResponse {
+func status(t *testing.T, r *runtimeState) statusResponse {
 	t.Helper()
 	w := httptest.NewRecorder()
 	r.serveStatus(w, httptest.NewRequest(http.MethodGet, "/status", nil))
@@ -116,7 +116,7 @@ func TestStatus_PipelinesOfActiveStanzas(t *testing.T) {
 	cfg := &schemas.KafkaInfo{Consumers: []*schemas.ConsumerConfig{
 		{Topics: []string{"a"}, Group: "g1"}, {Topics: nil, Group: "off"}, {Topics: []string{"b", "c"}, Group: "g2"},
 	}}
-	r := newReadiness(router.NewProducerRegistry(), cfg)
+	r := newRuntimeState(router.NewProducerRegistry(), cfg)
 
 	st := status(t, r)
 
@@ -129,7 +129,7 @@ func TestStatus_PipelinesOfActiveStanzas(t *testing.T) {
 // A record stuck in retry shows in /status, and readiness does not change because of it.
 func TestStatus_StuckRetryDoesNotAffectReadiness(t *testing.T) {
 	cfg := &schemas.KafkaInfo{Consumers: []*schemas.ConsumerConfig{{Topics: []string{"a"}, Group: "g"}}}
-	r := newReadiness(router.NewProducerRegistry(), cfg)
+	r := newRuntimeState(router.NewProducerRegistry(), cfg)
 	r.consumerUp()
 	state := r.pipelines[0].state
 	state.CallRetrying(&schemas.ConsumerEvent{}, time.Now().Add(-3*time.Minute))
@@ -153,7 +153,7 @@ func TestStatus_StuckRetryDoesNotAffectReadiness(t *testing.T) {
 // /status reports the process-wide pause in every pipeline entry; readiness ignores it.
 func TestStatus_ReportsPause(t *testing.T) {
 	cfg := &schemas.KafkaInfo{Consumers: []*schemas.ConsumerConfig{{Topics: []string{"a"}, Group: "g1"}, {Topics: []string{"b"}, Group: "g2"}}}
-	r := newReadiness(router.NewProducerRegistry(), cfg)
+	r := newRuntimeState(router.NewProducerRegistry(), cfg)
 	r.consumerUp()
 	r.consumerUp()
 

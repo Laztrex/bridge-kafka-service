@@ -21,6 +21,9 @@ certs/
 *.jks
 *.b64
 
+# The local application config; the template is configs/config_app.yaml.example (CONF-6)
+configs/config_app.yaml
+
 # Local settings of editors and coding assistants
 .vscode/
 .claude/

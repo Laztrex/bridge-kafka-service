@@ -41,18 +41,23 @@ var runSubscription = router.RunSubscription
 // responsePublish is a seam so tests can observe the per-pipeline publishers.
 var responsePublish = handlers.ResponsePublish
 
-// retryWindow is how long Kafka client creation is retried before giving up.
-var retryWindow = 5 * time.Minute
+// newProducerAttempt is one producer construction attempt, a seam for tests.
+var newProducerAttempt = router.NewProducer
+
+// newConsumerClientAttempt is one consumer client construction attempt, a seam for tests.
+var newConsumerClientAttempt = router.NewConsumerClient
 
 // Connect runs the service until ctx is cancelled or an unrecoverable error is returned.
-// HTTP starts first and never waits for Kafka, which connects in the background with retries;
-// Consumers start only after the producer settles, so no response goes into an empty registry.
-// A consumer that permanently cannot consume (client creation or subscription start fails) is fatal.
-// A producer that fails permanently is fatal whenever producers are configured: no consumer reads a
-// record and the process exits non-zero, so the supervisor restarts it instead of leaving it never
-// ready. SIGUSR1 toggles the process-wide pause that every subscription follows.
-// Shutdown stops intake, flushes queued responses, then closes the producer and sinks, all
-// bounded by timeouts.shutdown.
+// HTTP starts first and never waits for Kafka, which connects in the background with retries:
+// producer and consumer clients retry with exponential backoff and jitter until shutdown, so an
+// unreachable broker leaves the service up and not ready, with /readyz naming the missing
+// clients (LIFE-3). Consumers start only after the producer settles, so no response goes into
+// an empty registry. A subscription that cannot start for a reason retrying cannot fix — its
+// upstream cannot be constructed, or its consumer group cannot be created from a connected
+// client — is fatal: the process exits non-zero instead of reporting ready without reading.
+// SIGUSR1 toggles the process-wide pause that every subscription follows.
+// Shutdown answers 503 on publish and /readyz, keeps /healthz, /health and /status up until the
+// drain ends, and closes the HTTP server last, all bounded by timeouts.shutdown.
 func Connect(ctx context.Context, cfg *config.Config) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -89,15 +94,15 @@ func Connect(ctx context.Context, cfg *config.Config) error {
 	// the producer, so no reporter ever blocks on a full channel.
 	errCh := make(chan error, len(consumers)+2)
 
-	ready := newReadiness(registry, kafkaConfig)
-	srv := newHTTPServer(logTransaction, registry, kafkaConfig, ready, cfg.HTTPAddr)
+	runtime := newRuntimeState(registry, kafkaConfig)
+	srv := newHTTPServer(logTransaction, registry, kafkaConfig, runtime, cfg.HealthAddr)
 	go func() {
 		log.Info().Msgf("starting HTTP server at %s...", srv.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("http server: %w", err)
 		}
 	}()
-	startPprof(ctx, cfg.PprofAddr)
+	startPprof(ctx, cfg.DebugAddr)
 
 	// producerFailed records the producer outcome before producersSettled closes,
 	// so a consumer never starts reading when its responses could not be published.
@@ -110,7 +115,7 @@ func Connect(ctx context.Context, cfg *config.Config) error {
 		defer close(producersSettled)
 		if err := startProducer(ctx, kafkaConfig, producerTuning, registry); err != nil && ctx.Err() == nil {
 			producerFailed.Store(true)
-			errCh <- fmt.Errorf("permanently failed to create producer: %w", err)
+			errCh <- fmt.Errorf("producer creation failed: %w", err)
 		}
 	}()
 
@@ -128,7 +133,7 @@ func Connect(ctx context.Context, cfg *config.Config) error {
 		go func(queue <-chan *schemas.ConsumerEvent, workers int, state *transport.PipelineState) {
 			defer publishers.Done()
 			responsePublish(publishCtx, queue, workers, logTransaction, registry, state)
-		}(queues[i], transport.PublisherCount(c), ready.pipelines[i].state)
+		}(queues[i], transport.PublisherCount(c), runtime.pipelines[i].state)
 	}
 
 	var wg sync.WaitGroup
@@ -140,7 +145,7 @@ func Connect(ctx context.Context, cfg *config.Config) error {
 			consumerClient, err := newConsumerClientWithRetry(ctx, kafkaConfig, conf, consumerTuning)
 			if err != nil {
 				if ctx.Err() == nil {
-					errCh <- fmt.Errorf("permanently failed to create consumer client for %v: %w", conf.Topics, err)
+					errCh <- fmt.Errorf("consumer client creation failed for %v: %w", conf.Topics, err)
 				}
 				return
 			}
@@ -162,11 +167,11 @@ func Connect(ctx context.Context, cfg *config.Config) error {
 			}
 
 			log.Info().Msgf("consumer client initialized for topics: %v", conf.Topics)
-			ready.consumerUp()
-			if err := runSubscription(ctx, ready.pause, consumerClient, conf, queue, logTransaction, state); err != nil && ctx.Err() == nil {
+			runtime.consumerUp()
+			if err := runSubscription(ctx, runtime.pause, consumerClient, conf, queue, logTransaction, state); err != nil && ctx.Err() == nil {
 				errCh <- err
 			}
-		}(consumerConfig, queues[i], ready.pipelines[i].state)
+		}(consumerConfig, queues[i], runtime.pipelines[i].state)
 	}
 
 	usr1 := make(chan os.Signal, 1)
@@ -184,30 +189,53 @@ loop:
 			log.Error().Err(runErr).Msg("terminating: unrecoverable error")
 			break loop
 		case <-usr1:
-			ready.pause.Toggle()
+			runtime.pause.Toggle()
 		}
 	}
 
+	// Shutdown keeps the probes answering (design D4): the draining flag makes the publish
+	// endpoint and /readyz answer 503, intake stops, in-flight publish requests finish, then
+	// the pipelines, the response publishers and the producer close — every step bounded by
+	// timeouts.shutdown — and the HTTP server shuts down last with the time that remains.
+	runtime.beginDrain()
 	cancel()
 	shutdownCtx, stop := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer stop()
+	waitShutdownStep(shutdownCtx, "in-flight publish requests", runtime.inFlightPublish.Wait)
+	waitShutdownStep(shutdownCtx, "consumer pipelines", wg.Wait)
+	waitShutdownStep(shutdownCtx, "producer", producerBg.Wait)
+	stopPublish()
+	waitShutdownStep(shutdownCtx, "response publishers", publishers.Wait)
+	closeProducer(registry)
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error().Err(err).Msg("http server shutdown")
 	}
-	wg.Wait()
-	producerBg.Wait()
-	stopPublish()
-	publishers.Wait()
-	closeProducer(registry)
 
 	log.Info().Msg("shutdown complete")
 	return runErr
 }
 
+// waitShutdownStep waits for one shutdown step, bounded by the shutdown deadline: a step that
+// outlives it is logged and the shutdown moves on, so one stuck step cannot hold the process
+// past timeouts.shutdown.
+func waitShutdownStep(ctx context.Context, step string, wait func()) {
+	done := make(chan struct{})
+	go func() {
+		wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		log.Error().Msgf("shutdown did not finish %s within timeouts.shutdown", step)
+	}
+}
+
 // startProducer creates the single shared producer (when any is configured) and
-// binds it to every allowed topic. An error is returned so the caller can decide
-// whether it is fatal; a permanent failure is logged and leaves the registry
-// empty: publishing then answers 503 while consumption continues.
+// binds it to every allowed topic. With retries unbounded by a window, an error
+// means shutdown was requested; it is still returned so the caller can record the
+// outcome. A producer that never connects leaves the registry empty: publishing
+// answers 503 and consumers with a response_topic never start reading.
 func startProducer(ctx context.Context, kafkaConfig *schemas.KafkaInfo, tuning *router.Tuning, registry *router.ProducerRegistry) error {
 	if len(kafkaConfig.Producers) == 0 {
 		return nil
@@ -215,7 +243,7 @@ func startProducer(ctx context.Context, kafkaConfig *schemas.KafkaInfo, tuning *
 	producer, err := newProducerWithRetry(ctx, kafkaConfig, tuning)
 	if err != nil {
 		if ctx.Err() == nil {
-			log.Error().Msgf("permanently failed to create producer: %v", err)
+			log.Error().Msgf("producer creation failed: %v", err)
 		}
 		return err
 	}
@@ -323,20 +351,20 @@ func closeProducer(registry *router.ProducerRegistry) {
 
 func createProducerWithRetry(ctx context.Context, kafkaConfig *schemas.KafkaInfo, tuning *router.Tuning) (sarama.SyncProducer, error) {
 	var producer sarama.SyncProducer
-	var err error
 
 	operation := func() error {
-		producer, err = router.NewProducer(kafkaConfig, tuning)
+		p, err := newProducerAttempt(kafkaConfig, tuning)
 		if err != nil {
 			return fmt.Errorf("could not create producer: %v", err)
 		}
+		producer = p
 		return nil
 	}
 
 	expBackoff := backoff.NewExponentialBackOff()
-	expBackoff.MaxElapsedTime = retryWindow
+	expBackoff.MaxElapsedTime = 0 // no retry window: retry until the context is cancelled (LIFE-3)
 
-	err = backoff.RetryNotify(operation, backoff.WithContext(expBackoff, ctx), func(err error, d time.Duration) {
+	err := backoff.RetryNotify(operation, backoff.WithContext(expBackoff, ctx), func(err error, d time.Duration) {
 		log.Warn().Msgf("failed to create producer: %v. Retrying in %s", err, d)
 	})
 
@@ -345,20 +373,20 @@ func createProducerWithRetry(ctx context.Context, kafkaConfig *schemas.KafkaInfo
 
 func createConsumerClientWithRetry(ctx context.Context, kafkaConfig *schemas.KafkaInfo, consumerConfig *schemas.ConsumerConfig, tuning *router.Tuning) (sarama.Client, error) {
 	var consumerClient sarama.Client
-	var err error
 
 	operation := func() error {
-		consumerClient, err = router.NewConsumerClient(kafkaConfig, consumerConfig, tuning)
+		c, err := newConsumerClientAttempt(kafkaConfig, consumerConfig, tuning)
 		if err != nil {
 			return fmt.Errorf("could not create consumer for topics %v: %v", consumerConfig.Topics, err)
 		}
+		consumerClient = c
 		return nil
 	}
 
 	expBackoff := backoff.NewExponentialBackOff()
-	expBackoff.MaxElapsedTime = retryWindow
+	expBackoff.MaxElapsedTime = 0 // no retry window: retry until the context is cancelled (LIFE-3)
 
-	err = backoff.RetryNotify(operation, backoff.WithContext(expBackoff, ctx), func(err error, d time.Duration) {
+	err := backoff.RetryNotify(operation, backoff.WithContext(expBackoff, ctx), func(err error, d time.Duration) {
 		log.Warn().Msgf("consumer client connection failed: %v. Retrying in %s", err, d)
 	})
 
@@ -366,7 +394,7 @@ func createConsumerClientWithRetry(ctx context.Context, kafkaConfig *schemas.Kaf
 }
 
 // registerRoutes mounts the POST-only publish endpoint (other methods get 405).
-func registerRoutes(mux *http.ServeMux, logTransaction schemas.TransactionLogger, registry *router.ProducerRegistry, kafkaConfig *schemas.KafkaInfo) {
+func registerRoutes(mux *http.ServeMux, logTransaction schemas.TransactionLogger, registry *router.ProducerRegistry, kafkaConfig *schemas.KafkaInfo, runtime *runtimeState) {
 	pattern := fmt.Sprintf("POST /api/%v/publish", consts.ControllerVersionAPI)
 
 	if len(kafkaConfig.Producers) == 0 {
@@ -379,10 +407,16 @@ func registerRoutes(mux *http.ServeMux, logTransaction schemas.TransactionLogger
 
 	publish := middlewares.RequestIdMiddleware(handlers.NewHandlers(logTransaction, registry))
 	mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+		if runtime.draining.Load() {
+			http.Error(w, "service is shutting down", http.StatusServiceUnavailable)
+			return
+		}
 		if !registry.Ready() {
 			http.Error(w, "Publish functionality is not ready: Kafka producer is not connected", http.StatusServiceUnavailable)
 			return
 		}
+		runtime.inFlightPublish.Add(1)
+		defer runtime.inFlightPublish.Done()
 		publish.ServeHTTP(w, r)
 	})
 	log.Info().Msg("publish endpoint registered")
@@ -402,13 +436,13 @@ var httpReadTimeout = 30 * time.Second
 
 // newHTTPServer serves the publish API and probes (/health is the legacy alias of /healthz) on
 // its own mux, which keeps the pprof handlers off the public listener.
-func newHTTPServer(logTransaction schemas.TransactionLogger, registry *router.ProducerRegistry, kafkaConfig *schemas.KafkaInfo, ready *readiness, addr string) *http.Server {
+func newHTTPServer(logTransaction schemas.TransactionLogger, registry *router.ProducerRegistry, kafkaConfig *schemas.KafkaInfo, runtime *runtimeState, addr string) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", handlers.Health)
 	mux.HandleFunc("GET /healthz", handlers.Health)
-	mux.HandleFunc("GET /readyz", ready.serveReadyz)
-	mux.HandleFunc("GET /status", ready.serveStatus)
-	registerRoutes(mux, logTransaction, registry, kafkaConfig)
+	mux.HandleFunc("GET /readyz", runtime.serveReadyz)
+	mux.HandleFunc("GET /status", runtime.serveStatus)
+	registerRoutes(mux, logTransaction, registry, kafkaConfig, runtime)
 
 	return &http.Server{
 		Addr:              addr,
@@ -420,13 +454,13 @@ func newHTTPServer(logTransaction schemas.TransactionLogger, registry *router.Pr
 }
 
 // startPprof serves the profiling handlers on their own address, only when
-// pprof.addr is configured, and stops with ctx.
+// debug.addr is configured, and stops with ctx.
 func startPprof(ctx context.Context, addr string) {
 	if addr == "" {
 		return
 	}
 	if host, _, err := net.SplitHostPort(addr); err != nil || !isLoopback(host) {
-		log.Warn().Msgf("pprof.addr %s is not a loopback address: profiling is reachable from the network", addr)
+		log.Warn().Msgf("debug.addr %s is not a loopback address: profiling is reachable from the network", addr)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/debug/pprof/", pprof.Index)

@@ -32,12 +32,16 @@ const (
 	// EnvFile is the optional dotenv file in the working directory; only CONFIG_PATH is taken from it.
 	EnvFile = consts.EnvFile
 
-	DefaultLogLevel        = "debug"
+	DefaultLogLevel        = "info"
 	DefaultShutdownTimeout = 10 * time.Second
 )
 
-// DefaultHTTPAddr is the address of the HTTP server (publish API and probes) when http.addr is unset.
-var DefaultHTTPAddr = consts.ControllerHost + ":" + consts.ControllerHTTPPort
+// DefaultHealthAddr is the address of the HTTP server (publish API and probes) when health.addr
+// and its alias http.addr are both unset.
+var DefaultHealthAddr = consts.ControllerHost + ":" + consts.ControllerHTTPPort
+
+// logLevels are the values log.level accepts, lower case.
+var logLevels = map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 
 // The yaml tags below name the config keys: they document the file format and feed make
 // docs-check. Values are read by Load (see source), not by tag-based decoding.
@@ -59,9 +63,9 @@ type Retention struct {
 
 // Config is the loaded application configuration.
 type Config struct {
-	LogLevel          string        `yaml:"logLevel"`
-	HTTPAddr          string        `yaml:"http.addr"`
-	PprofAddr         string        `yaml:"pprof.addr"`          // empty disables profiling
+	LogLevel          string        `yaml:"log.level"`
+	HealthAddr        string        `yaml:"health.addr"`
+	DebugAddr         string        `yaml:"debug.addr"`          // empty disables profiling
 	AuditGRPCEndpoint string        `yaml:"audit.grpc_endpoint"` // empty disables the gRPC audit sink
 	ShutdownTimeout   time.Duration `yaml:"timeouts.shutdown"`
 	KafkaTLS          KafkaTLS      `yaml:"-"`
@@ -76,9 +80,9 @@ type Config struct {
 	MetricFileName string `yaml:"METRIC_FILE_NAME"`
 	SystemID       string `yaml:"SYSTEM_ID"` // x-client-id when a record carries none
 
-	// Warnings lists keys that the loader does not know. They are not errors, so that files
-	// written for older versions keep loading; the caller logs them.
-	Warnings []string
+	// Deprecations lists the deprecated alias keys that took effect, as messages for the caller
+	// to log once: "http.addr is deprecated, use health.addr".
+	Deprecations []string
 }
 
 // MetricFilePath is the metrics file (JSON lines); the audit file is <MetricFilePath>.audit.
@@ -116,6 +120,10 @@ func LogFilePath(getenv func(string) string) string {
 }
 
 // Load reads and parses the config at path, applies defaults and builds the Kafka TLS settings.
+// Configuration problems — an unknown key, a key set together with its deprecated alias, an
+// invalid log level — are joined into one error, and the Config is still returned in that case,
+// so --check-config can also run the checks that need a parsed file. A file that cannot be read,
+// parsed or decoded returns a nil Config.
 // Validation of the Kafka setup is separate (Validate, PrepareUpstreams).
 func Load(path string, getenv func(string) string) (*Config, error) {
 	raw, err := os.ReadFile(path)
@@ -128,9 +136,6 @@ func Load(path string, getenv func(string) string) (*Config, error) {
 	}
 
 	cfg := &Config{
-		LogLevel:          orDefault(src.String("logLevel"), DefaultLogLevel),
-		HTTPAddr:          orDefault(src.String("http.addr"), DefaultHTTPAddr),
-		PprofAddr:         src.String("pprof.addr"),
 		AuditGRPCEndpoint: src.String("audit.grpc_endpoint"),
 		ShutdownTimeout:   DefaultShutdownTimeout,
 		KafkaTLS: KafkaTLS{
@@ -184,8 +189,49 @@ func Load(path string, getenv func(string) string) (*Config, error) {
 	cfg.Kafka.Consumers, cfg.Kafka.Producers = consumers, producers
 	cfg.Kafka.TLSConf = NewKafkaTLS(cfg.KafkaTLS)
 
-	cfg.Warnings = unknownKeys(src, unused)
-	return cfg, nil
+	// The address and level keys replace older spellings, which stay as deprecated aliases: an
+	// alias alone takes effect and is reported once, a key and its alias together is a
+	// validation error naming both. The environment overrides of the key and the alias
+	// (HEALTH_ADDR/HTTP_ADDR, DEBUG_ADDR/PPROF_ADDR, LOG_LEVEL/LOGLEVEL) follow the same rules.
+	var errs []error
+	resolvePair := func(key, alias string) (value string, set bool, err error) {
+		vKey, keySet := src.value(key)
+		vAlias, aliasSet := src.value(alias)
+		if keySet && aliasSet {
+			return "", false, fmt.Errorf("%s and its deprecated alias %s are both set; remove one", key, alias)
+		}
+		if keySet {
+			return toString(vKey), true, nil
+		}
+		if aliasSet {
+			cfg.Deprecations = append(cfg.Deprecations, alias+" is deprecated, use "+key)
+			return toString(vAlias), true, nil
+		}
+		return "", false, nil
+	}
+	addr, _, err := resolvePair("health.addr", "http.addr")
+	if err != nil {
+		errs = append(errs, err)
+	}
+	cfg.HealthAddr = orDefault(addr, DefaultHealthAddr)
+	debugAddr, _, err := resolvePair("debug.addr", "pprof.addr")
+	if err != nil {
+		errs = append(errs, err)
+	}
+	cfg.DebugAddr = debugAddr
+	level, _, err := resolvePair("log.level", "logLevel")
+	if err != nil {
+		errs = append(errs, err)
+	}
+	cfg.LogLevel = orDefault(level, DefaultLogLevel)
+	if !logLevels[strings.ToLower(cfg.LogLevel)] {
+		errs = append(errs, fmt.Errorf("log.level: expected one of debug, info, warn, error, got %q", cfg.LogLevel))
+	}
+
+	for _, key := range unknownKeys(src, unused) {
+		errs = append(errs, fmt.Errorf("unknown config key %q", key))
+	}
+	return cfg, errors.Join(errs...)
 }
 
 // applyConsumerDefaults fills unset service settings.
@@ -213,30 +259,61 @@ func servicePort(src *source, host string) string {
 	return orDefault(src.String(strings.ToUpper(strings.ReplaceAll(host, "-", "_"))+"_SERVICE_PORT"), consts.PortServiceDefault)
 }
 
-// knownTopLevel are the keys the loader reads at the top level (lower case).
-var knownTopLevel = map[string]bool{
-	"loglevel": true, "http": true, "pprof": true, "audit": true, "kafka": true,
-	"consumer": true, "producer": true, "timeouts": true, "retention": true,
-	"log_path": true, "log_file_name": true, "metric_path": true, "metric_file_name": true,
-	"system_id": true, "config_path": true,
+// knownPaths are the dotted key paths the loader reads outside the struct-decoded sections,
+// lower case; a nested form (log: {level: x}) and its dotted form (log.level) are the same path.
+var knownPaths = map[string]bool{
+	"log.level": true, "loglevel": true,
+	"health.addr": true, "http.addr": true,
+	"debug.addr": true, "pprof.addr": true,
+	"audit.grpc_endpoint":   true,
+	"timeouts.shutdown":     true,
+	"retention.max_backups": true, "retention.max_age_days": true,
+	"kafka.tls.client.cert.path": true, "kafka.tls.client.key.path": true,
+	"kafka.tls.ca.path": true, "kafka.tls.skip.insecure.verify": true,
+	"metric_path": true, "metric_file_name": true, "system_id": true,
+	"config_path": true, "log_path": true, "log_file_name": true,
 }
 
-// unknownKeys lists top-level keys the loader ignores, plus unknown keys inside the decoded
-// sections. Keys under kafka.tls are read separately and are known.
+// decodedSections are decoded into structs, and their unknown keys are reported by the decoding
+// with exact paths, like kafka.version_typo or consumer[0].retries.
+var decodedSections = map[string]bool{"kafka": true, "consumer": true, "producer": true}
+
+// unknownKeys lists every key the loader does not read: unknown top-level keys, unknown keys
+// inside the sections read by dotted name (timeouts, retention, audit, the address and level
+// pairs) and the unused keys the struct decoding reports for the decoded sections. Keys under
+// kafka.tls are read separately by dotted name and are known.
 func unknownKeys(src *source, unused []string) []string {
-	var out []string
-	for k := range src.values {
-		root := strings.SplitN(k, ".", 2)[0]
-		if knownTopLevel[root] || strings.HasSuffix(k, "_service_port") {
-			continue
-		}
-		out = append(out, k)
-	}
+	out := make([]string, 0, len(unused))
 	for _, u := range unused {
 		if !strings.HasPrefix(u, "kafka.tls") {
 			out = append(out, u)
 		}
 	}
+	var walk func(prefix string, m map[string]any)
+	walk = func(prefix string, m map[string]any) {
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			path := k
+			if prefix != "" {
+				path = prefix + "." + k
+			}
+			if decodedSections[path] || strings.HasSuffix(path, "_service_port") {
+				continue // the struct decoding reports its own unknowns; service ports are dynamic
+			}
+			if sub, isMap := m[k].(map[string]any); isMap {
+				walk(path, sub)
+				continue
+			}
+			if !knownPaths[path] {
+				out = append(out, path)
+			}
+		}
+	}
+	walk("", src.values)
 	sort.Strings(out)
 	return out
 }

@@ -3,7 +3,7 @@
 # package must reach FLOOR. Excluded from the calculation: generated protobuf
 # code (*.pb.go), test helpers (testutil/, test/), the thin cmd/ entrypoint
 # and runnable examples (examples/).
-# Shared by Go services (docs/conventions.md); keep the copies identical.
+# Shared by Go services (platform spec lang-go/platform-go-quality); keep the copies identical.
 set -euo pipefail
 
 PROFILE="${1:-coverage.out}"

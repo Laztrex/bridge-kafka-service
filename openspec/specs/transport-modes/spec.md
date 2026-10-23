@@ -41,7 +41,7 @@ The system MUST funnel every successful upstream response of a pipeline into tha
 #### Scenario: Publication channel saturated
 
 - **WHEN** the pipeline's response queue is full because publishing is slow and the stanza's failure policy is `skip`
-- **THEN** newly produced responses are dropped with a warning logged rather than blocking consumption, each dropped response is counted once in `controller_kafka_response_service_failure_total` with its request id, and the originating message is still settled
+- **THEN** newly produced responses are dropped with a warning logged rather than blocking consumption, each dropped response is counted once in `bridge_kafka_service_response_service_failure_total` with its request id, and the originating message is still settled
 
 #### Scenario: Publication channel saturated in retry mode
 

@@ -1,0 +1,64 @@
+# Template of the application config: copy to configs/config_app.yaml (which git ignores),
+# fill in the values and start with it, for example:
+#   cp configs/config_app.yaml.example configs/config_app.yaml
+#   ./bridge-kafka-service --config configs/config_app.yaml
+# The stand configuration for docker-compose is configs/config_compose.yaml. Every key is listed
+# here with a placeholder, never a real value; see README "Keys" for the meaning of each one.
+
+log.level: info             # debug | info (default) | warn | error
+health.addr: 0.0.0.0:8081   # publish API and probes
+debug.addr: ""              # pprof listener, for example 127.0.0.1:6060; empty disables it
+
+kafka:
+  brokers: broker1:9092,broker2:9092
+  version: ""               # Kafka version, for example 2.3.0; empty means the client default
+  tls:                      # client TLS for the brokers; omit for plaintext
+    client:
+      cert:
+        path: certs/client_cert.pem
+      key:
+        path: certs/client_key.pem
+    ca:
+      path: certs/cacert.pem
+    skip:
+      insecure:
+        verify: false
+
+consumer:
+  - topics: app.requests
+    group: app.bridge
+    client_id: app-bridge
+    response_topic: app.responses      # must be listed under producer too
+    on_failure: skip                   # skip (default) | retry
+    service:
+      name: app-svc
+      port: "8080"
+      path: /predict
+      max_conn: 10
+      timeout: 30s
+      protocol: http                   # http (default) | grpc
+      tls:                             # encryption to the service; omit for plaintext
+        mode: none                     # none (default) | tls | mtls
+        ca_path: certs/ca.pem
+        cert_path: certs/client.pem
+        key_path: certs/client.key
+        server_name: app-svc.internal
+        skip_verify: false
+
+producer:
+  - topic: app.responses
+  - topic: app.publish.out
+
+audit:
+  grpc_endpoint: audit-svc:50051       # empty disables the gRPC audit sink
+
+timeouts:
+  shutdown: 10s
+
+retention:
+  max_backups: 0                       # 0 keeps every backup
+  max_age_days: 0                      # 0 has no age limit
+
+METRIC_PATH: ./
+METRIC_FILE_NAME: app-metrics.log
+SYSTEM_ID: ""

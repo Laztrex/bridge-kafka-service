@@ -1,8 +1,8 @@
 # gRPC upstream, plaintext. Start the example service first:
 #   go run ./examples/grpc-model -addr 127.0.0.1:50051
 #   ./bridge-kafka-service --config examples/config_grpc.yaml
-logLevel: info
-http.addr: 127.0.0.1:8081
+log.level: info
+health.addr: 127.0.0.1:8081
 
 kafka:
   brokers: kafka:29092,kafka2:29093,kafka3:29094,kafka4:29095

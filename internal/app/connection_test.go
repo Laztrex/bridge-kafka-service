@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/IBM/sarama"
@@ -39,7 +40,7 @@ func server(t *testing.T, cfg *schemas.KafkaInfo, reg *router.ProducerRegistry) 
 	l.Run()
 	t.Cleanup(l.Shutdown)
 
-	return newHTTPServer(l, reg, cfg, newReadiness(reg, cfg), "127.0.0.1:0")
+	return newHTTPServer(l, reg, cfg, newRuntimeState(reg, cfg), "127.0.0.1:0")
 }
 
 func post(srv *http.Server, topic string) *httptest.ResponseRecorder {
@@ -149,7 +150,7 @@ func TestStartProducerReturnsItsErrorAndRegistersNothing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	assert.Error(t, startProducer(ctx, &schemas.KafkaInfo{Producers: []*schemas.ProducerConfig{{Topic: "a"}}}, nil, reg),
-		"a cancelled window is still an error; the caller checks ctx")
+		"cancellation is still an error; the caller checks ctx")
 	assert.False(t, reg.Ready())
 }
 
@@ -222,42 +223,136 @@ func TestUnversionedPublishPathIsNotFound(t *testing.T) {
 // connectEnv runs Connect from the repo root (it reads configs/*.yaml by relative
 // path) with metrics redirected into a temp dir; the returned func wraps a Kafka setup
 // into an application config.
-func connectEnv(t *testing.T, retry time.Duration) func(*schemas.KafkaInfo) *config.Config {
+func connectEnv(t *testing.T) func(*schemas.KafkaInfo) *config.Config {
 	t.Helper()
 	t.Chdir("../..")
 	metrics := t.TempDir()
-
-	old := retryWindow
-	retryWindow = retry
-	t.Cleanup(func() { retryWindow = old })
 	return func(k *schemas.KafkaInfo) *config.Config {
 		return &config.Config{
-			HTTPAddr: "127.0.0.1:0", ShutdownTimeout: config.DefaultShutdownTimeout,
+			HealthAddr: "127.0.0.1:0", ShutdownTimeout: config.DefaultShutdownTimeout,
 			MetricPath: metrics, MetricFileName: "m.log", Kafka: k,
 		}
 	}
 }
 
-func TestConnect_ConsumerPermanentFailureReturnsError(t *testing.T) {
-	wrap := connectEnv(t, 300*time.Millisecond)
+// An unreachable broker keeps the clients retrying (LIFE-3): the process stays up and not ready,
+// /healthz answers 200, /readyz answers 503 naming the
+// clients, and SIGTERM (a cancelled context) ends it with exit code 0.
+func TestConnect_UnreachableBrokerKeepsServiceUp(t *testing.T) {
+	wrap := connectEnv(t)
 	cfg := &schemas.KafkaInfo{
-		Brokers: []string{freeAddr(t)},
-		Version: "2.3.0",
+		Brokers:   []string{freeAddr(t)},
+		Version:   "2.3.0",
+		Producers: []*schemas.ProducerConfig{{Topic: "out"}},
 		Consumers: []*schemas.ConsumerConfig{{
 			Topics: []string{"t"}, Group: "g", ClientId: "c",
 			Service: schemas.HostConfig{Name: "svc", Port: "1", Path: "/"},
 		}},
 	}
+	appCfg := wrap(cfg)
+	appCfg.HealthAddr = freeAddr(t)
 
+	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- Connect(context.Background(), wrap(cfg)) }()
+	go func() { done <- Connect(ctx, appCfg) }()
 
+	require.Eventually(t, func() bool { return canDial(appCfg.HealthAddr) }, 5*time.Second, 20*time.Millisecond)
+
+	resp, err := http.Get("http://" + appCfg.HealthAddr + "/healthz")
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "liveness must not depend on Kafka")
+
+	readyz, err := http.Get("http://" + appCfg.HealthAddr + "/readyz")
+	require.NoError(t, err)
+	readyzBody, err := io.ReadAll(readyz.Body)
+	require.NoError(t, err)
+	require.NoError(t, readyz.Body.Close())
+	assert.Equal(t, http.StatusServiceUnavailable, readyz.StatusCode)
+	assert.Contains(t, string(readyzBody), "kafka producer is not connected")
+	assert.Contains(t, string(readyzBody), "not all kafka consumers are running")
+
+	cancel()
 	select {
 	case err := <-done:
-		assert.ErrorContains(t, err, "permanently failed to create consumer client")
+		assert.NoError(t, err, "SIGTERM must exit 0 while the broker is unreachable")
 	case <-time.After(15 * time.Second):
-		t.Fatal("Connect kept running after the consumer could not be created")
+		t.Fatal("Connect did not return after cancellation")
 	}
+}
+
+// Advance virtual time beyond the former five-minute window while exercising the real
+// retry loops. Recovery must still register the producer and initialize the consumer.
+func TestKafkaClientRetriesRecoverBeyondFormerWindow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		oldProducer, oldConsumer := newProducerAttempt, newConsumerClientAttempt
+		t.Cleanup(func() { newProducerAttempt, newConsumerClientAttempt = oldProducer, oldConsumer })
+		var reachable atomic.Bool
+		var producerAttempts, consumerAttempts atomic.Int32
+		producer := &countingProducer{}
+		client := mocksarama.NewFakeClient()
+		newProducerAttempt = func(*schemas.KafkaInfo, *router.Tuning) (sarama.SyncProducer, error) {
+			producerAttempts.Add(1)
+			if !reachable.Load() {
+				return nil, errors.New("broker unavailable")
+			}
+			return producer, nil
+		}
+		newConsumerClientAttempt = func(*schemas.KafkaInfo, *schemas.ConsumerConfig, *router.Tuning) (sarama.Client, error) {
+			consumerAttempts.Add(1)
+			if !reachable.Load() {
+				return nil, errors.New("broker unavailable")
+			}
+			return client, nil
+		}
+		conf := &schemas.ConsumerConfig{Topics: []string{"in"}}
+		cfg := &schemas.KafkaInfo{
+			Producers: []*schemas.ProducerConfig{{Topic: "out"}},
+			Consumers: []*schemas.ConsumerConfig{conf},
+		}
+		registry := router.NewProducerRegistry()
+		runtime := newRuntimeState(registry, cfg)
+		srv := newHTTPServer(nil, registry, cfg, runtime, "")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		producerDone, consumerDone := make(chan error, 1), make(chan error, 1)
+		go func() { producerDone <- startProducer(ctx, cfg, nil, registry) }()
+		go func() {
+			_, err := createConsumerClientWithRetry(ctx, cfg, conf, nil)
+			if err == nil {
+				runtime.consumerUp()
+			}
+			consumerDone <- err
+		}()
+		time.Sleep(6 * time.Minute)
+		synctest.Wait()
+		for name, done := range map[string]<-chan error{"producer": producerDone, "consumer": consumerDone} {
+			select {
+			case err := <-done:
+				t.Fatalf("%s stopped retrying before recovery: %v", name, err)
+			default:
+			}
+		}
+		if producerAttempts.Load() < 2 || consumerAttempts.Load() < 2 {
+			t.Fatal("both clients must make repeated connection attempts")
+		}
+		if w := probe(t, srv, http.MethodGet, "/readyz"); w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("during outage: %d %s", w.Code, w.Body.String())
+		}
+		if w := probe(t, srv, http.MethodGet, "/healthz"); w.Code != http.StatusOK {
+			t.Fatalf("liveness during outage: %d", w.Code)
+		}
+		reachable.Store(true)
+		if err := <-producerDone; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-consumerDone; err != nil {
+			t.Fatal(err)
+		}
+		if w := probe(t, srv, http.MethodGet, "/readyz"); w.Code != http.StatusOK {
+			t.Fatalf("after recovery: %d %s", w.Code, w.Body.String())
+		}
+	})
 }
 
 // subscriptionFailureSeams makes consumer clients fakes and replaces runSubscription with run.
@@ -285,7 +380,7 @@ func subscriptionFailureConfig(t *testing.T) *schemas.KafkaInfo {
 }
 
 func TestConnect_SubscriptionStartFailureIsFatal(t *testing.T) {
-	wrap := connectEnv(t, time.Minute)
+	wrap := connectEnv(t)
 	subscriptionFailureSeams(t, func(context.Context) error {
 		return errors.New("subscription for topics [orders]: cannot create consumer group: no group")
 	})
@@ -304,7 +399,7 @@ func TestConnect_SubscriptionStartFailureIsFatal(t *testing.T) {
 }
 
 func TestConnect_SubscriptionFailureDuringShutdownIsNotReported(t *testing.T) {
-	wrap := connectEnv(t, time.Minute)
+	wrap := connectEnv(t)
 	started := make(chan struct{})
 	subscriptionFailureSeams(t, func(parent context.Context) error {
 		close(started)
@@ -334,7 +429,7 @@ func TestConnect_SubscriptionFailureDuringShutdownIsNotReported(t *testing.T) {
 // Each stanza with a response_topic gets its own queue and publishers; a stanza without one gets
 // neither, and shutdown returns only after every publisher has drained.
 func TestConnect_EachResponseTopicStanzaGetsItsOwnPublisher(t *testing.T) {
-	wrap := connectEnv(t, time.Minute)
+	wrap := connectEnv(t)
 	oldProducer, oldClient, oldRun, oldPublish := newProducerWithRetry, newConsumerClientWithRetry, runSubscription, responsePublish
 	t.Cleanup(func() {
 		newProducerWithRetry, newConsumerClientWithRetry, runSubscription, responsePublish = oldProducer, oldClient, oldRun, oldPublish
@@ -433,7 +528,7 @@ func tuningDir(t *testing.T, files map[string]string) {
 }
 
 func TestConnect_MissingProducerTuningStopsStartup(t *testing.T) {
-	wrap := connectEnv(t, time.Minute)
+	wrap := connectEnv(t)
 	tuningDir(t, map[string]string{"config_consumer.yaml": "consumer:\n  return:\n    errors: true\n"})
 	var producerCalls atomic.Int32
 	old := newProducerWithRetry
@@ -459,7 +554,7 @@ func TestConnect_MissingProducerTuningStopsStartup(t *testing.T) {
 }
 
 func TestConnect_TuningOfAnUnusedClientIsNotRequired(t *testing.T) {
-	wrap := connectEnv(t, time.Minute)
+	wrap := connectEnv(t)
 	tuningDir(t, map[string]string{"config_consumer.yaml": "consumer:\n  return:\n    errors: true\n"})
 	started := make(chan struct{})
 	subscriptionFailureSeams(t, func(parent context.Context) error {
@@ -483,7 +578,7 @@ func TestConnect_TuningOfAnUnusedClientIsNotRequired(t *testing.T) {
 }
 
 func TestConnect_UnknownRebalanceStrategyStopsStartup(t *testing.T) {
-	wrap := connectEnv(t, time.Minute)
+	wrap := connectEnv(t)
 	tuningDir(t, map[string]string{"config_consumer.yaml": "consumer:\n  group:\n    rebalance:\n      strategy: fair\n"})
 
 	err := Connect(context.Background(), wrap(subscriptionFailureConfig(t)))
@@ -496,7 +591,7 @@ func TestConnect_UnknownRebalanceStrategyStopsStartup(t *testing.T) {
 // A stanza without topics gets no Kafka client and no subscription, is named once in the log,
 // and is not counted in /status.
 func TestConnect_StanzaWithoutTopicsIsDisabled(t *testing.T) {
-	wrap := connectEnv(t, time.Minute)
+	wrap := connectEnv(t)
 	logs := &syncLog{}
 	oldLogger := log.Logger
 	log.Logger = zerolog.New(logs)
@@ -525,7 +620,7 @@ func TestConnect_StanzaWithoutTopicsIsDisabled(t *testing.T) {
 		},
 	}
 	appCfg := wrap(cfg)
-	appCfg.HTTPAddr = freeAddr(t)
+	appCfg.HealthAddr = freeAddr(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- Connect(ctx, appCfg) }()
@@ -535,13 +630,98 @@ func TestConnect_StanzaWithoutTopicsIsDisabled(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("the active stanza did not start")
 	}
-	assert.Contains(t, pollStatus(t, appCfg.HTTPAddr), `"consumers_total":1`)
+	assert.Contains(t, pollStatus(t, appCfg.HealthAddr), `"consumers_total":1`)
 	cancel()
 	require.NoError(t, <-done)
 
 	assert.Equal(t, int32(1), clients.Load(), "only the active stanza gets a Kafka client")
 	assert.Contains(t, logs.String(), "consumer #2 has no topics: disabled")
 	assert.NotContains(t, logs.String(), "no topics provided")
+}
+
+// During the drain after SIGTERM (a cancelled root context), with a slow in-flight upstream call
+// still running: /healthz answers 200, /readyz answers 503 with the reason "shutting down", a new
+// publish request answers 503 naming the shutdown, and Connect returns nil within
+// timeouts.shutdown once the call finishes (LIFE-1).
+func TestConnect_ProbesAnswerDuringDrain(t *testing.T) {
+	wrap := connectEnv(t)
+
+	// A slow in-flight upstream call: the subscription stays busy until the test releases it.
+	release := make(chan struct{})
+	oldProducer, oldClient, oldRun := newProducerWithRetry, newConsumerClientWithRetry, runSubscription
+	newProducerWithRetry = func(context.Context, *schemas.KafkaInfo, *router.Tuning) (sarama.SyncProducer, error) {
+		return &countingProducer{}, nil
+	}
+	newConsumerClientWithRetry = func(context.Context, *schemas.KafkaInfo, *schemas.ConsumerConfig, *router.Tuning) (sarama.Client, error) {
+		return mocksarama.NewFakeClient(), nil
+	}
+	runSubscription = func(context.Context, *router.Pause, sarama.Client, *schemas.ConsumerConfig, chan<- *schemas.ConsumerEvent, *observability.FileTransactionLogger, *transport.PipelineState) error {
+		<-release
+		return nil
+	}
+	t.Cleanup(func() {
+		newProducerWithRetry, newConsumerClientWithRetry, runSubscription = oldProducer, oldClient, oldRun
+	})
+
+	cfg := &schemas.KafkaInfo{
+		Brokers:   []string{freeAddr(t)},
+		Version:   "2.3.0",
+		Producers: []*schemas.ProducerConfig{{Topic: "out"}},
+		Consumers: []*schemas.ConsumerConfig{{
+			Topics: []string{"orders"}, Group: "g", ClientId: "c",
+			Service: schemas.HostConfig{Name: "svc", Port: "1", Path: "/"},
+		}},
+	}
+	appCfg := wrap(cfg)
+	appCfg.HealthAddr = freeAddr(t)
+	appCfg.ShutdownTimeout = 10 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Connect(ctx, appCfg) }()
+
+	require.Eventually(t, func() bool { return canDial(appCfg.HealthAddr) }, 5*time.Second, 20*time.Millisecond)
+	cancelled := time.Now()
+	cancel()
+
+	// /readyz answers 503 with "shutting down" while the in-flight call is still running.
+	require.Eventually(t, func() bool {
+		resp, err := http.Get("http://" + appCfg.HealthAddr + "/readyz")
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(string(body), "shutting down")
+	}, 5*time.Second, 20*time.Millisecond, "/readyz must report the drain")
+
+	// /healthz keeps answering 200 until the drain ends.
+	resp, err := http.Get("http://" + appCfg.HealthAddr + "/healthz")
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// A new publish request answers 503 naming the shutdown, even with the producer connected.
+	req, err := http.NewRequest(http.MethodPost, "http://"+appCfg.HealthAddr+"/api/"+consts.ControllerVersionAPI+"/publish", strings.NewReader(`{}`))
+	require.NoError(t, err)
+	req.Header.Set(consts.HeaderProduceTopicName, "out")
+	presp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(presp.Body)
+	require.NoError(t, err)
+	require.NoError(t, presp.Body.Close())
+	assert.Equal(t, http.StatusServiceUnavailable, presp.StatusCode)
+	assert.Contains(t, string(body), "service is shutting down")
+
+	// The in-flight call finishes and the process exits 0 within timeouts.shutdown.
+	close(release)
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(appCfg.ShutdownTimeout):
+		t.Fatal("Connect did not return within timeouts.shutdown")
+	}
+	assert.Less(t, time.Since(cancelled), appCfg.ShutdownTimeout, "the drain must fit within timeouts.shutdown")
 }
 
 type syncLog struct {
@@ -562,7 +742,7 @@ func (l *syncLog) String() string {
 }
 
 func TestConnect_GracefulShutdownOnContextCancel(t *testing.T) {
-	wrap := connectEnv(t, 5*time.Minute)
+	wrap := connectEnv(t)
 	cfg := &schemas.KafkaInfo{
 		Brokers:   []string{freeAddr(t)},
 		Version:   "2.3.0",
@@ -585,12 +765,12 @@ func TestConnect_GracefulShutdownOnContextCancel(t *testing.T) {
 }
 
 func TestConnect_InvalidConfig(t *testing.T) {
-	wrap := connectEnv(t, time.Second)
+	wrap := connectEnv(t)
 	assert.Error(t, Connect(context.Background(), wrap(&schemas.KafkaInfo{})))
 }
 
 func TestConnect_InvalidUpstreamTLSAbortsBeforeAnythingStarts(t *testing.T) {
-	wrap := connectEnv(t, time.Second)
+	wrap := connectEnv(t)
 	cfg := &schemas.KafkaInfo{
 		Brokers: []string{freeAddr(t)},
 		Version: "2.3.0",
@@ -617,7 +797,7 @@ func TestConnect_InvalidUpstreamTLSAbortsBeforeAnythingStarts(t *testing.T) {
 }
 
 func TestConnect_UnknownProtocolAborts(t *testing.T) {
-	wrap := connectEnv(t, time.Second)
+	wrap := connectEnv(t)
 	cfg := &schemas.KafkaInfo{
 		Brokers: []string{freeAddr(t)},
 		Consumers: []*schemas.ConsumerConfig{{
@@ -681,11 +861,16 @@ func pollStatus(t *testing.T, addr string) string {
 	return ""
 }
 
-func TestConnect_ProducerPermanentFailureIsFatalWhenResponsesAreExpected(t *testing.T) {
-	wrap := connectEnv(t, 300*time.Millisecond)
+// A producer that never connects keeps the service up (LIFE-3): consumers with a response_topic
+// never start reading, /readyz names the missing producer, and cancellation ends the process
+// with exit code 0 instead of a permanent-failure exit.
+func TestConnect_ProducerNeverReadyKeepsServiceUpAndGatesConsumers(t *testing.T) {
+	wrap := connectEnv(t)
+	// The producer retries "forever": like a real retry loop, it returns only on shutdown.
 	oldProducer := newProducerWithRetry
-	newProducerWithRetry = func(context.Context, *schemas.KafkaInfo, *router.Tuning) (sarama.SyncProducer, error) {
-		return nil, errors.New("broker unreachable")
+	newProducerWithRetry = func(parent context.Context, _ *schemas.KafkaInfo, _ *router.Tuning) (sarama.SyncProducer, error) {
+		<-parent.Done()
+		return nil, parent.Err()
 	}
 	t.Cleanup(func() { newProducerWithRetry = oldProducer })
 
@@ -698,21 +883,28 @@ func TestConnect_ProducerPermanentFailureIsFatalWhenResponsesAreExpected(t *test
 			Service: schemas.HostConfig{Name: "svc", Port: "1", Path: "/"},
 		}},
 	}
+	appCfg := wrap(cfg)
+	appCfg.HealthAddr = freeAddr(t)
 
+	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- Connect(context.Background(), wrap(cfg)) }()
+	go func() { done <- Connect(ctx, appCfg) }()
 
+	assert.Contains(t, pollStatus(t, appCfg.HealthAddr), `"consumers_up":0`,
+		"no consumer subscribes while the producer is not up")
+	assert.Contains(t, pollStatus(t, appCfg.HealthAddr), "kafka producer is not connected")
+
+	cancel()
 	select {
 	case err := <-done:
-		require.Error(t, err)
-		assert.ErrorContains(t, err, "permanently failed to create producer")
+		assert.NoError(t, err)
 	case <-time.After(15 * time.Second):
-		t.Fatal("Connect kept running after the producer failed permanently")
+		t.Fatal("Connect did not return after cancellation")
 	}
 }
 
 func TestConnect_ProducerFailureGatesConsumersWithResponseTopics(t *testing.T) {
-	wrap := connectEnv(t, time.Minute)
+	wrap := connectEnv(t)
 	runs := failingProducerSeams(t, 500*time.Millisecond) // a window to observe /status
 	cfg := &schemas.KafkaInfo{
 		Brokers:   []string{freeAddr(t)},
@@ -724,27 +916,27 @@ func TestConnect_ProducerFailureGatesConsumersWithResponseTopics(t *testing.T) {
 		}},
 	}
 	appCfg := wrap(cfg)
-	appCfg.HTTPAddr = freeAddr(t)
+	appCfg.HealthAddr = freeAddr(t)
 
 	done := make(chan error, 1)
 	go func() { done <- Connect(context.Background(), appCfg) }()
 
-	assert.Contains(t, pollStatus(t, appCfg.HTTPAddr), `"consumers_up":0`,
+	assert.Contains(t, pollStatus(t, appCfg.HealthAddr), `"consumers_up":0`,
 		"no consumer subscribes when the producer cannot be created")
 
 	select {
 	case err := <-done:
-		assert.ErrorContains(t, err, "permanently failed to create producer")
+		assert.ErrorContains(t, err, "producer creation failed")
 	case <-time.After(15 * time.Second):
 		t.Fatal("Connect kept running after the producer failed permanently")
 	}
 	assert.Zero(t, runs.Load(), "a stanza with response_topic must never subscribe after a producer failure")
 }
 
-// A producer that cannot be created is fatal even when no stanza has a response_topic: the process
-// exits instead of consuming while never ready, and no subscription starts first.
+// An unexpected error returned by the producer factory is fatal even without a response_topic.
+// Transient broker outages stay inside the retry loop and do not return such an error.
 func TestConnect_ProducerFailureIsFatalWithoutResponseTopics(t *testing.T) {
-	wrap := connectEnv(t, time.Minute)
+	wrap := connectEnv(t)
 	runs := failingProducerSeams(t, 0)
 	cfg := &schemas.KafkaInfo{
 		Brokers:   []string{freeAddr(t)},
@@ -761,7 +953,7 @@ func TestConnect_ProducerFailureIsFatalWithoutResponseTopics(t *testing.T) {
 
 	select {
 	case err := <-done:
-		assert.ErrorContains(t, err, "permanently failed to create producer")
+		assert.ErrorContains(t, err, "producer creation failed")
 	case <-time.After(15 * time.Second):
 		t.Fatal("Connect kept running after the producer failed permanently")
 	}
@@ -770,7 +962,7 @@ func TestConnect_ProducerFailureIsFatalWithoutResponseTopics(t *testing.T) {
 
 // Every subscription follows one process-wide pause, which /status reports per pipeline.
 func TestConnect_SubscriptionsShareOnePause(t *testing.T) {
-	wrap := connectEnv(t, time.Minute)
+	wrap := connectEnv(t)
 	oldClient, oldRun := newConsumerClientWithRetry, runSubscription
 	t.Cleanup(func() { newConsumerClientWithRetry, runSubscription = oldClient, oldRun })
 	newConsumerClientWithRetry = func(context.Context, *schemas.KafkaInfo, *schemas.ConsumerConfig, *router.Tuning) (sarama.Client, error) {
@@ -812,7 +1004,7 @@ func TestConnect_SubscriptionsShareOnePause(t *testing.T) {
 // One run reports every problem, from every part of the check, and Connect stops on it before
 // opening the metric file.
 func TestCheck_ReportsProblemsOfEveryPart(t *testing.T) {
-	wrap := connectEnv(t, time.Minute)
+	wrap := connectEnv(t)
 	tuningDir(t, map[string]string{})
 	cfg := &schemas.KafkaInfo{
 		Brokers: []string{"127.0.0.1:1"},
@@ -838,7 +1030,7 @@ func TestCheck_ReportsProblemsOfEveryPart(t *testing.T) {
 }
 
 func TestCheck_ValidConfigurationReturnsTopologyWarnings(t *testing.T) {
-	wrap := connectEnv(t, time.Minute)
+	wrap := connectEnv(t)
 	tuningDir(t, map[string]string{"config_consumer.yaml": "consumer:\n  return:\n    errors: true\n"})
 	svc := schemas.HostConfig{Name: "svc", Port: "8080", Path: "/"}
 	cfg := &schemas.KafkaInfo{

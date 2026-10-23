@@ -2,7 +2,7 @@
 
 **bridge-kafka-service** bridges Kafka topics and external services. It consumes records from Kafka topics, forwards them to a configured service and publishes the response back to Kafka. HTTP and gRPC transports are implemented; the architecture allows adding other protocols.
 
-> External identifiers (`x-controller-kafka-*` headers, `controller_kafka` metric names, Envoy ALS audit values) are kept for backward compatibility with existing deployments.
+> The headers `x-bridge-kafka-produce-topic` and `x-bridge-kafka-header-*`, legacy Envoy ALS audit values and the gRPC method `/controller_kafka.BaseModelInterface/Predict` are frozen by spec `project-identity`. Metrics use the prefix `bridge_kafka_service_`; see the migration table under "Logs and metrics".
 
 ## Run
 
@@ -18,6 +18,7 @@ Check a configuration without starting the service (for example in a deploy pipe
 ~~~bash
 ./bridge-kafka-service --check-config --config examples/config_local_http.yaml
 # configuration examples/config_local_http.yaml is valid      (stdout, exit code 0)
+# error: unknown config key "kafka.brokrs"                   (stderr, exit code 1)
 # error: invalid consumer topology: response topics form a cycle ...   (stderr, exit code 1)
 ~~~
 
@@ -40,7 +41,7 @@ docker compose down -v         # stop and remove the stand
 Requirements:
 
 * Docker + Docker Compose for the full stand (the simplest path);
-* Go 1.27.2+ to build and test without Docker;
+* stable Go 1.27.x, at least 1.27.3, to build and test without Docker;
 * `protoc` only if you change `.proto` files (see "gRPC stubs");
 * `openssl` only for demo certificates (TLS/mTLS examples).
 
@@ -64,6 +65,8 @@ echo "127.0.0.1 kafka kafka2 kafka3 kafka4" | sudo tee -a /etc/hosts
 ~~~
 Ready-made configs are in `examples/` (`config_local_http.yaml`, `config_grpc.yaml`, `config_grpc_mtls.yaml`); tests validate them. Config selection order: the `--config` flag → the `CONFIG_PATH` variable → `configs/config_app.yaml`.
 
+To use the default path, copy `configs/config_app.yaml.example` to `configs/config_app.yaml` and fill in the deployment values; the local file is ignored by Git. The Compose stand selects `configs/config_compose.yaml` through `CONFIG_PATH` in `docker.env`.
+
 Send and read with the same commands as in "Local stand", but with this config's topics (`demo.in` → `demo.out`; `curl` publishing goes to `demo.http.out`):
 ~~~bash
 printf 'x-request-id:local-001\t{"params":[5,10]}\n' | docker compose exec -T kafka \
@@ -77,7 +80,7 @@ Stop: `Ctrl+C` / `SIGTERM` (graceful, up to `timeouts.shutdown`, default 10s, fo
 
 ## Local stand
 
-Starts 4 Kafka brokers + ZooKeeper, Kafka UI and the bridge. The stand configuration (`configs/config_app.yaml`, mounted read-only) points its consumers at `app-svc` and the audit at `audit-grpc-svc`; provide these services — or your own — in a `compose.override.yaml` next to `compose.yaml`: docker compose merges it automatically when it exists.
+Starts 4 Kafka brokers + ZooKeeper, Kafka UI and the bridge. The stand configuration (`configs/config_compose.yaml`, mounted read-only, selected by `CONFIG_PATH` in `docker.env`) points its consumers at `app-svc` and the audit at `audit-grpc-svc`; provide these services — or your own — in a `compose.override.yaml` next to `compose.yaml`: docker compose merges it automatically when it exists.
 
 | What | Address from the host | Address inside the compose network |
 |---|---|---|
@@ -85,7 +88,7 @@ Starts 4 Kafka brokers + ZooKeeper, Kafka UI and the bridge. The stand configura
 | Kafka UI | `http://localhost:8090` | — |
 | Kafka (brokers) | `localhost:39092`, `localhost:39093`, `localhost:39094`, `localhost:39095` | `kafka:29092`, `kafka2:29093`, `kafka3:29094`, `kafka4:29095` |
 
-**Step 1. Start.** The images default to public `golang:1.27.2` and `alpine:3.21`; set `BUILDER_IMAGE`/`RUNTIME_IMAGE` to use others:
+**Step 1. Start.** The images default to public `golang:1.27.3` and `alpine:3.21`; set `BUILDER_IMAGE`/`RUNTIME_IMAGE` to use others:
 ~~~bash
 docker compose up -d --build
 docker compose ps                                  # every service must be Up
@@ -128,7 +131,7 @@ docker compose logs bridge-kafka-service | grep demo-001
 
 # metrics of this request (JSON lines)
 docker compose exec bridge-kafka-service sh -c 'grep demo-001 app-metrics.log'
-#  {"rqUId":"demo-001","metric_name":"controller_kafka_consume_success_total","metric_value":"1"}
+#  {"rqUId":"demo-001","metric_name":"bridge_kafka_service_consume_success_total","metric_value":"1"}
 #  ...
 
 # audit of this request: always mirrored to app-metrics.log.audit (JSON lines),
@@ -142,7 +145,7 @@ The same is visible in Kafka UI: <http://localhost:8090> → Topics → `bridge.
 docker compose down -v        # -v also removes volumes
 ~~~
 
-> The stand config is `configs/` of the repository (`config_app.yaml`, `config_consumer.yaml`, `config_producer.yaml`), mounted read-only into the container; variables are in `docker.env`. Logs and metrics are written to the container working directory `/go/src/bridge-kafka-service` (`app.log`, `app-metrics.log`, `app-metrics.log.audit`).
+> The stand config is `configs/` of the repository (`config_compose.yaml`, `config_consumer.yaml`, `config_producer.yaml`), mounted read-only into the container; variables are in `docker.env` (`CONFIG_PATH` selects the app config). Logs and metrics are written to the container working directory `/go/src/bridge-kafka-service` (`app.log`, `app-metrics.log`, `app-metrics.log.audit`).
 
 ## Tests
 
@@ -174,7 +177,7 @@ go test ./examples/grpc-model                             # the example gRPC ser
 | Configuration | `internal/config`, `examples/` | YAML parsing compatible with earlier versions (snapshots in `internal/config/testdata/compat`), fail-closed TLS, example validity |
 
 ### Coverage
-- **Coverage gate**: `make coverage-check` generates `coverage.out` and fails if total statement coverage is below `COVER_THRESHOLD` (**80%**) or any package is below `PACKAGE_FLOOR` (**60%**). `*.pb.go`, `testutil/`, `test/` and `cmd/` are excluded. Details: `docs/coverage.md`.
+- **Coverage gate**: `make coverage-check` generates `coverage.out` and fails if total statement coverage is below `COVER_THRESHOLD` (**80%**) or any package is below `PACKAGE_FLOOR` (**60%**). `*.pb.go`, `testutil/`, `test/`, `cmd/` and `examples/` are excluded. Details: `docs/coverage.md`.
 - HTML report: `make coverage-html && open coverage.html`.
 - Override the thresholds locally: `COVER_THRESHOLD=50 PACKAGE_FLOOR=40 make coverage-check`.
 
@@ -200,8 +203,6 @@ make coverage-html && open coverage.html
 
 The history of decisions and the long-term rationale for the threshold scale are in
 [docs/coverage.md](docs/coverage.md).
-
-Project conventions shared with other Go services: [docs/conventions.md](docs/conventions.md).
 
 ## How it works
 
@@ -291,9 +292,9 @@ Changing the rebalance strategy of a running group needs a restart of **every** 
 Values are defaults or examples.
 
 ~~~yaml
-logLevel: debug                         # debug | anything else means info
-http.addr: 0.0.0.0:8081                 # publish API and probes
-pprof.addr: ""                          # profiling address; empty (default) disables it, keep it on 127.0.0.1
+log.level: info                         # debug | info (default) | warn | error; an unknown value stops startup
+health.addr: 0.0.0.0:8081               # publish API and probes
+debug.addr: ""                          # profiling address; empty (default) disables it, keep it on 127.0.0.1
 audit.grpc_endpoint: ""                 # Envoy ALS receiver; audit is always written to <metrics file>.audit too
 timeouts.shutdown: 10s                  # on SIGTERM: drain of HTTP requests and active service calls
 retention.max_backups: 0                # backups kept per metric/audit file; 0 (default) keeps all
@@ -333,10 +334,11 @@ producer:
   - topic: bridge.responses.1
 ~~~
 
-Compatibility rules (kept from earlier versions, so existing files need no changes):
-- keys are case-insensitive, and a nested key may be written nested (`http: {addr: ...}`) or dotted (`http.addr: ...`);
-- a non-empty environment variable named after a top-level key overrides it: `HTTP_ADDR`, `LOGLEVEL`, `PPROF_ADDR`, `AUDIT_GRPC_ENDPOINT`, `TIMEOUTS_SHUTDOWN`, `KAFKA_TLS_CA_PATH` and so on;
-- unknown keys do not stop startup: each is logged as a warning (`unknown config key ... is ignored`).
+Compatibility rules (kept from earlier versions, so existing files need few changes):
+- keys are case-insensitive, and a nested key may be written nested (`health: {addr: ...}`) or dotted (`health.addr: ...`);
+- a non-empty environment variable named after a top-level key overrides it: `HEALTH_ADDR`, `LOG_LEVEL`, `DEBUG_ADDR`, `AUDIT_GRPC_ENDPOINT`, `TIMEOUTS_SHUTDOWN`, `KAFKA_TLS_CA_PATH` and so on;
+- `http.addr`, `pprof.addr` and `logLevel` are deprecated aliases of `health.addr`, `debug.addr` and `log.level`: an alias alone takes effect and logs one deprecation warning naming the key to use, while a key set together with its alias stops startup naming both;
+- an unknown key stops startup with an error naming it (`unknown config key "..."`), reported together with every other configuration error.
 
 ### Environment variables
 ~~~shell
@@ -445,7 +447,7 @@ Some failures depend only on the record or its response, so repeating the call c
 
 `retry` requires `service.max_conn > 0`, otherwise startup fails. When all `max_conn` slots are retrying, the pipeline stops reading Kafka until the service recovers, so an outage loses nothing. Each failed attempt is logged as a warning with the attempt number and `failing_for`, how long the record has been failing; metrics count only the final outcome of a record. `GET /status` shows, per pipeline, how many records are retrying and how old the oldest retry is (see "Probes").
 
-With `retry` a response is never dropped either: when the pipeline's publish queue (1000 responses) is full because Kafka writes are slow, the call waits for space instead of dropping the response and settling the offset (`skip` drops it with a warning and counts it as a failed publication in `controller_kafka_response_service_failure_total`, with its egress audit entry). And when Kafka rejects the write itself, the response is republished with the same backoff (1s doubling up to 30s) until the broker accepts it: the offset is held and the upstream is not called again, so a broker outage stalls `retry` pipelines instead of losing their responses. Each pipeline has its own publish queue and writes up to 16 responses at once (`max_conn` if lower, so a `max_conn: 1` pipeline writes one at a time, in order), so a response topic that is broken or slow holds back only the pipeline that writes to it, never the others. Each failed attempt is logged as a warning; metrics and audit record only the final outcome. The exception is a non-transient publish error: a response larger than `producer.maxmessagebytes` (1 MiB by default; the broker's `message.max.bytes` applies as well), a record the broker rejects as invalid, or a feature the configured Kafka version lacks. It is attempted once, recorded as a failure and the offset is settled, like a poison record. To publish larger responses, raise `producer.maxmessagebytes` in `config_producer.yaml` together with the broker and topic limits. On shutdown the backoff wait ends and an unpublished response is not settled, so its record is redelivered after restart.
+With `retry` a response is never dropped either: when the pipeline's publish queue (1000 responses) is full because Kafka writes are slow, the call waits for space instead of dropping the response and settling the offset (`skip` drops it with a warning and counts it as a failed publication in `bridge_kafka_service_response_service_failure_total`, with its egress audit entry). And when Kafka rejects the write itself, the response is republished with the same backoff (1s doubling up to 30s) until the broker accepts it: the offset is held and the upstream is not called again, so a broker outage stalls `retry` pipelines instead of losing their responses. Each pipeline has its own publish queue and writes up to 16 responses at once (`max_conn` if lower, so a `max_conn: 1` pipeline writes one at a time, in order), so a response topic that is broken or slow holds back only the pipeline that writes to it, never the others. Each failed attempt is logged as a warning; metrics and audit record only the final outcome. The exception is a non-transient publish error: a response larger than `producer.maxmessagebytes` (1 MiB by default; the broker's `message.max.bytes` applies as well), a record the broker rejects as invalid, or a feature the configured Kafka version lacks. It is attempted once, recorded as a failure and the offset is settled, like a poison record. To publish larger responses, raise `producer.maxmessagebytes` in `config_producer.yaml` together with the broker and topic limits. On shutdown the backoff wait ends and an unpublished response is not settled, so its record is redelivered after restart.
 
 A record that fails 5 attempts **while other records of the same pipeline get answers** is treated as poison: a failure metric, a `poison` warning with its request id, the offset is settled. During an outage nothing is skipped. With `max_conn: 1` there are no other calls to compare with, so such a record is retried until the service answers; failures that depend only on the record (above) are not retried at all, so only network failures, such as a timeout on one heavy payload, can hold a `max_conn: 1` pipeline this way, and `/status` shows it.
 
@@ -467,6 +469,16 @@ The app tracks four metric types per operation:
 * Duration Milliseconds: operation duration, from the start of *that* event to its close (independent of concurrent requests, excluding time in the metrics queue; an event without a start yields 0)
 
 A response dropped from a full publish queue under `on_failure: skip` counts as a `response_service` failure. Earlier releases showed such drops only in the logs, so the metric may rise after an upgrade on pipelines whose queue saturates.
+
+Metric names carry the service prefix `bridge_kafka_service_` (MET-2). The rename from the former prefixes (MET-6):
+
+| Old name | New name |
+|---|---|
+| `controller_kafka_<event>_{success_total,failure_total,requests_total,duration_ms}` | `bridge_kafka_service_<event>_{success_total,failure_total,requests_total,duration_ms}` |
+| `bridge_service_pod_cpu_usage` | `bridge_kafka_service_pod_cpu_usage` |
+| `bridge_service_pod_memory_usage` | `bridge_kafka_service_pod_memory_usage` |
+
+The `<event>` part is one of `consume`, `produce`, `request_service`, `response_service`. The old names are not written in parallel — a metric file with both spellings would double every counter that consumers sum by event. Before this version is deployed, dashboards and alerts that read the metric file switch their queries to the new names (or match both).
 
 ### Logging
 * Structured logging with Zerolog
@@ -490,8 +502,12 @@ Log levels:
 | Path | Purpose | Response |
 |---|---|---|
 | `GET /healthz` (and the former `/health`) | liveness: the process is running; does not depend on Kafka | `200 {"status":"running"}` |
-| `GET /readyz` | readiness: the producer is connected (when producers are configured) and the consumer of every stanza with topics is running | `200 {"status":"ready"}` / `503 {"status":"not ready","reasons":[...]}` |
+| `GET /readyz` | readiness: the required producer is registered, every active consumer client has initialized, and shutdown has not begun | `200 {"status":"ready"}` / `503 {"status":"not ready","reasons":[...]}` |
 | `GET /status` | details for humans (`consumers_total` counts stanzas with topics) | `200 {"ready":..., "producer_ready":..., "consumers_up":..., "consumers_total":..., "pipelines":[...]}` |
+
+Configure the application container's Kubernetes readiness probe to call `/readyz` on `health.addr`. Istio can forward this probe through its sidecar; sidecar readiness alone cannot determine whether the application's Kafka clients have initialized. The application supplies the readiness result, and Kubernetes uses it to control Service traffic. This does not stop Kafka consumption, which the application controls separately.
+
+The Kafka readiness checks track client initialization, not continuous broker reachability. Pause and upstream retries do not change readiness. Internally, `runtimeState` owns this shared state together with pipeline status and shutdown tracking; readiness is one view of it.
 
 `pipelines` has one entry per stanza with topics, in configuration order. Readiness does not depend on it:
 
@@ -505,9 +521,9 @@ Log levels:
 * `uncommitted`: records handed out by the current claims and not yet committed, including those processed but held behind an earlier record (they are delivered again after a restart)
 * `paused`: whether consumption is paused by `SIGUSR1` (one state for the whole process)
 
-**No authentication.** `POST /api/v1/publish` and the probes on `http.addr` accept any client that can reach the port: a client can publish to every topic listed under `producer:`. Expose `http.addr` only to trusted clients (bind address, network policy, or an authenticating gateway in front). The listener closes a connection whose request is not fully received within 30 seconds or that stays idle for 120 seconds; a publish that waits for Kafka is never cut off while it answers.
+**No authentication.** `POST /api/v1/publish` and the probes on `health.addr` accept any client that can reach the port: a client can publish to every topic listed under `producer:`. Expose `health.addr` only to trusted clients (bind address, network policy, or an authenticating gateway in front). The listener closes a connection whose request is not fully received within 30 seconds or that stays idle for 120 seconds; a publish that waits for Kafka is never cut off while it answers.
 
-Profiling (`net/http/pprof`) is never served on this port: it runs only on `pprof.addr` (off by default); a non-loopback `pprof.addr` is logged as a warning.
+Profiling (`net/http/pprof`) is never served on this port: it runs only on `debug.addr` (off by default); a non-loopback `debug.addr` is logged as a warning.
 
 ### Health check
 ~~~shell
@@ -528,16 +544,16 @@ One `Dockerfile`, two images (build arguments; without a value docker takes them
 
 | Argument | Purpose | Default |
 |---|---|---|
-| `BUILDER_IMAGE` | Go image that builds the binary; its Go version must satisfy the `go` directive in `go.mod` | `golang:1.27.2` |
+| `BUILDER_IMAGE` | Go image that builds the binary; use stable Go 1.27.x with a patch version at least the `go` directive in `go.mod` | `golang:1.27.3` |
 | `RUNTIME_IMAGE` | lightweight runtime image: the binary is static (`CGO_ENABLED=0`, time zones embedded) and needs only `sh` and the system CA roots | `alpine:3.21` |
-| `BUILD_TAGS` | extra Go build tags, comma-separated, appended to `timetzdata`; the release image is built with `release` (docs/conventions.md, section 12) | empty (dev) |
+| `BUILD_TAGS` | extra Go build tags, comma-separated, appended to `timetzdata`; the release image is built with `release` (platform spec `lang-go/platform-go-quality`) | empty (dev) |
 
 The image runs as an unprivileged user (uid 1001). Configuration is never baked into the image: mount it at `./configs`.
 
 ~~~bash
 make image                                                      # version, commit and build date embedded
 # other base images
-docker build --build-arg BUILDER_IMAGE=golang:1.27.2 --build-arg RUNTIME_IMAGE=alpine:3.21 -t bridge-kafka-service .
+docker build --build-arg BUILDER_IMAGE=golang:1.27.3 --build-arg RUNTIME_IMAGE=alpine:3.21 -t bridge-kafka-service .
 ~~~
 
 > **Changed:** the `runtime-dev` target (configs baked into the image) is removed; the compose stand mounts `configs/` instead. Other base images are passed with `BUILDER_IMAGE`/`RUNTIME_IMAGE` as above.
@@ -585,11 +601,11 @@ template:
 
 ### Startup, shutdown and signals
 
-* **The HTTP server and `/health` start immediately**, without waiting for Kafka. The producer and consumers connect in the background with exponential backoff (up to 5 minutes). Until the producer connects, `POST /api/v1/publish` returns `503`; consumers start reading only once the producer is ready or permanently unavailable.
-* If a consumer client cannot be created within 5 minutes, the process **exits with code 1** (so the orchestrator restarts it) instead of idling. The same happens when the producer cannot be created within 5 minutes, **whenever producers are configured**: no consumer reads a record first. Earlier releases kept a deployment without any `response_topic` consuming in that case, with `/readyz` answering 503 forever; such a process now restarts. A consumption-only deployment that does not publish should list no `producer:` entries.
+* **The HTTP server and `/health` start immediately**, without waiting for Kafka. The producer and consumers connect in the background with exponential backoff and jitter until shutdown, without a five-minute retry window. Until the producer connects, `POST /api/v1/publish` returns `503`; consumers start reading only once the configured producer is ready. A consumption-only deployment that does not publish should list no `producer:` entries.
+* An unreachable broker leaves the process **up and not ready**: `/healthz` answers 200 and `/readyz` answers 503 naming the clients still initializing. Connection attempts continue, and readiness becomes 200 when the required clients initialize. `SIGTERM` interrupts retry backoff and starts normal shutdown.
 * If a subscription cannot start after its client was created (the service connection cannot be set up, the consumer group cannot be created), the process also **exits with code 1**, and the error names the stanza's topics; it never keeps running while reporting ready without reading. The configuration causes of this are rejected at startup instead: `kafka.version` below 0.10.2 with active consumers, an invalid `service.name`/`service.port` of any stanza, an HTTP `service.path` that does not start with `/`.
 * **Configuration errors are reported together.** Startup runs every check (Kafka setup, service settings, how stanzas fit together, Kafka tuning files) before stopping, so one run lists every problem, each with its stanza and rule. Only a file that cannot be parsed at all stops at the first error. `--check-config` runs the same checks without starting (see "Run").
-* `SIGTERM` / `SIGINT`: graceful shutdown. HTTP intake and Kafka reading stop; in-flight upstream calls get up to `timeouts.shutdown` in total to finish, and every record that finishes in that time is committed before the consumer group session is released, so it is not redelivered. Records still unfinished after it, and buffered records not yet sent to the service, are not committed and will be redelivered (at-least-once). Then the metrics and audit queues are flushed and the producer and files are closed.
+* `SIGTERM` / `SIGINT`: graceful shutdown. The service first turns **draining**: `POST /api/v1/publish` answers `503` (`service is shutting down`) and `/readyz` answers `503` with the reason `shutting down`, while `/healthz`, `/health` and `/status` keep answering until the drain ends — the HTTP server closes last. HTTP intake and Kafka reading stop; in-flight upstream calls get up to `timeouts.shutdown` in total to finish, and every record that finishes in that time is committed before the consumer group session is released, so it is not redelivered. Records still unfinished after it, and buffered records not yet sent to the service, are not committed and will be redelivered (at-least-once). Then the metrics and audit queues are flushed and the producer and files are closed.
 * `SIGUSR1` toggles pause/resume of reading **for all** consumers of the process. The pause is one state of the process: a partition the process receives while paused (after a rebalance, for example) is paused as soon as its claim starts, and records Kafka has already delivered are held, not sent to the service, until the next `SIGUSR1`. Records already sent finish as usual. `GET /status` shows `paused` for every pipeline.
 
 Kubernetes/OpenShift probe example:
@@ -600,24 +616,18 @@ readinessProbe:
   httpGet: { path: /readyz, port: 8081 }
 ~~~
 
-## Conventions: exceptions and deviations
+## Platform
 
-The service follows the shared Go service conventions ([docs/conventions.md](docs/conventions.md)).
+The service follows the platform (layers `core`, `env-public`, `lang-go`), read through the `platform` store; the release it follows is recorded in `.platform-standards.yaml` (`aligned_with`). The binding workflow is `core/platform-sdd-workflow`.
 
-Compatibility exceptions (kept so that existing deployments need no changes):
+The service is aligned with `v3.0.0`. Its module minimum and default builder are Go 1.27.3; build and test toolchains must use stable Go 1.27.x with a patch version at least the module minimum.
 
-| Exception | Instead of |
-|---|---|
-| unknown config keys are logged as warnings | failing startup (conventions, section 4) |
-| keys `logLevel`, `http.addr`, dotted or nested; environment overrides named after keys (`HTTP_ADDR`, ...); `CONFIG_PATH` also read from `.env` | `log.level`, `health.addr` (sections 4, 6, 8) |
-| metric prefix `controller_kafka`, legacy header and audit identifiers | the service name (section 7) |
-| `/health` alias of `/healthz`; profiling address key `pprof.addr` | section 8 |
+Register the platform clone once per machine with `openspec store register <platform-clone> --id platform`; `openspec doctor` verifies the reference. The store's `.openspec-store/store.yaml` identifies the source repository. This service consumes it through `references` in `openspec/config.yaml` and does not need its own store declaration.
 
-Open deviations:
-
-| Section | Deviation |
-|---|---|
-| 10 Tests | testify in existing tests (converted when touched) |
+* **Strict keys:** an unknown configuration key fails startup and `--check-config` with the key named. Run `bridge-kafka-service --check-config` on every deployed configuration before upgrading: files that loaded with warnings stop loading.
+* **Deprecated key aliases:** `http.addr`, `pprof.addr` and `logLevel` still work and are logged once as deprecated; each is used only when `health.addr`, `debug.addr` or `log.level` is unset, and a key set together with its alias fails validation.
+* The other legacy wire identifiers (the headers `x-bridge-kafka-produce-topic` and `x-bridge-kafka-header-*`, the ALS cluster and fallback values, the gRPC method `/controller_kafka.BaseModelInterface/Predict`) are frozen by spec `project-identity` until an explicit migration change replaces them.
+* Deviations from platform requirements are approved exemptions in the platform registry (`exemptions/bridge-kafka-service.yaml` in the platform repository), never lists in this repository.
 
 ## Project layout
 
@@ -637,8 +647,8 @@ bridge-kafka-service/
 │   ├── router/          # Kafka consumer/producer lifecycle
 │   ├── schemas/         # Data structures
 │   └── transport/       # Service calls: the Upstream interface (HTTP and gRPC), shared settle/response publishing; modelrpc/ holds generated gRPC stubs
-├── configs/             # Config files (config_app.yaml, config_consumer.yaml, config_producer.yaml)
-├── docs/                # Conventions, flow diagram, coverage gate
+├── configs/             # Config files (config_compose.yaml, config_consumer.yaml, config_producer.yaml; config_app.yaml.example template)
+├── docs/                # Flow diagram and coverage gate
 ├── examples/            # Ready-made example configs (HTTP, gRPC, gRPC+mTLS)
 │   └── grpc-model/      # Example gRPC service (Predict) for checking protocol: grpc
 ├── make/common.mk       # Makefile part shared with other Go services
@@ -842,12 +852,12 @@ Common problems:
 
 * Memory usage: monitor the number of concurrent service requests (capped at 512 per fast-mode pipeline; set `service.max_conn` for a lower limit)
 
-* Profiling: enabled only by `pprof.addr` in the config (a separate port; keep it on 127.0.0.1)
+* Profiling: enabled only by `debug.addr` in the config (a separate port; keep it on 127.0.0.1)
 
 * DNS resolution: enable debug logging to diagnose DNS problems
 
 To diagnose, enable debug logging in the config:
 
 ~~~yaml
-logLevel: debug
+log.level: debug
 ~~~

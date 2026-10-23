@@ -1,5 +1,5 @@
 # The workflow only calls Makefile targets: the Makefile defines the checks, and locally they run
-# with the same commands (make ci, make image). See docs/conventions.md, section 13.
+# with the same commands (make ci, make image). Platform spec: env-public/platform-ci-pipeline.
 #
 # Steps run sequentially: a failed check stops the job and the image is not built.
 # There is no integration step: the project has no integration tests (unit tests use stubs).

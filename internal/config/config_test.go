@@ -106,8 +106,8 @@ func TestValidateKafkaVersion(t *testing.T) {
 func TestLoadAppliesDefaults(t *testing.T) {
 	cfg := mustLoad(t, "kafka:\n  brokers: b:9092\nconsumer:\n  - topics: t\n    group: g\n    service:\n      name: svc\nproducer:\n  - topic: out\n", nil)
 
-	if cfg.LogLevel != DefaultLogLevel || cfg.HTTPAddr != DefaultHTTPAddr || cfg.ShutdownTimeout != DefaultShutdownTimeout {
-		t.Fatalf("defaults: %q %q %v", cfg.LogLevel, cfg.HTTPAddr, cfg.ShutdownTimeout)
+	if cfg.LogLevel != DefaultLogLevel || cfg.HealthAddr != DefaultHealthAddr || cfg.ShutdownTimeout != DefaultShutdownTimeout {
+		t.Fatalf("defaults: %q %q %v", cfg.LogLevel, cfg.HealthAddr, cfg.ShutdownTimeout)
 	}
 	if !reflect.DeepEqual(cfg.Kafka.Brokers, []string{"b:9092"}) || cfg.Kafka.Producers[0].Topic != "out" {
 		t.Fatalf("kafka: %+v", cfg.Kafka)
@@ -185,31 +185,147 @@ func TestShutdownTimeout(t *testing.T) {
 	}
 }
 
-// Keys the loader does not know are reported, not rejected: files written for older versions keep loading.
-func TestUnknownKeysAreWarnings(t *testing.T) {
-	cfg := mustLoad(t, `logLevel: info
-legacy_flag: true
-kafka:
-  brokers: b
-  tls:
-    ca:
-      path: ca.pem
-consumer:
-  - topics: t
-    group: g
-    retries: 3
-    service:
-      name: s
-APP_SVC_SERVICE_PORT: 1
-LOG_PATH: /x
-`, nil)
-	want := []string{"consumer[0].retries", "legacy_flag"}
-	if len(cfg.Warnings) != len(want) {
-		t.Fatalf("warnings: %v", cfg.Warnings)
+// An unknown key is an error, not a warning: files that load must contain only known keys. Every
+// unknown key is named, including unknown keys inside the sections read by dotted name.
+func TestUnknownKeysAreErrors(t *testing.T) {
+	base := "kafka:\n  brokers: b\nconsumer:\n  - topics: t\n    group: g\n    service:\n      name: s\n"
+	for _, c := range []struct {
+		name string
+		yaml string
+		want []string
+	}{
+		{"two unknown keys", base + "kafka.brokrs: b2\ntimeouts.shutdwon: 5s\n", []string{`unknown config key "kafka.brokrs"`, `unknown config key "timeouts.shutdwon"`}},
+		{"nested unknowns", "logLevel: info\nlegacy_flag: true\n" + base + "timeouts:\n  shutdwon: 5s\n", []string{`unknown config key "legacy_flag"`, `unknown config key "timeouts.shutdwon"`}},
+		{"unknown in a decoded section", "kafka:\n  brokers: b\nconsumer:\n  - topics: t\n    group: g\n    service:\n      name: s\n  - topics: t2\n    group: g2\n    retries: 3\n    service:\n      name: s\n", []string{`unknown config key "consumer[1].retries"`}},
+		{"known keys stay known", base + "kafka.tls.skip.insecure.verify: true\nLOG_PATH: /x\nMY_SVC_SERVICE_PORT: 1\naudit.grpc_endpoint: a:1\nretention:\n  max_backups: 3\n", nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg, err := Load(writeFile(t, t.TempDir(), "app.yaml", c.yaml), env(nil))
+			for _, want := range c.want {
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %v must contain %q", err, want)
+				}
+			}
+			if c.want == nil {
+				if err != nil {
+					t.Fatalf("known keys must load, got %v", err)
+				}
+				if len(cfg.Deprecations) != 0 {
+					t.Fatalf("deprecations: %v", cfg.Deprecations)
+				}
+			}
+		})
 	}
-	for i, w := range want {
-		if !strings.HasSuffix(cfg.Warnings[i], w) {
-			t.Fatalf("warnings: %v, want %v", cfg.Warnings, want)
+}
+
+// A key and its deprecated alias follow the same rules for every pair: the key alone works, the
+// alias alone works and is reported once, both set fails validation naming both, and the
+// environment overrides of the key and the alias follow the same rules (design D1).
+func TestDeprecatedKeyAliases(t *testing.T) {
+	pairs := []struct{ key, alias, keyVal, aliasVal, envKey, envAlias string }{
+		{"health.addr", "http.addr", "0.0.0.0:9000", "0.0.0.0:9001", "HEALTH_ADDR", "HTTP_ADDR"},
+		{"debug.addr", "pprof.addr", "127.0.0.1:6060", "127.0.0.1:6061", "DEBUG_ADDR", "PPROF_ADDR"},
+		{"log.level", "logLevel", "warn", "debug", "LOG_LEVEL", "LOGLEVEL"},
+	}
+	for _, p := range pairs {
+		t.Run(p.key, func(t *testing.T) {
+			keyFile := p.key + ": " + p.keyVal + "\n"
+			aliasFile := p.alias + ": " + p.aliasVal + "\n"
+			check := func(yaml string, vars map[string]string) (*Config, error) {
+				return Load(writeFile(t, t.TempDir(), "app.yaml", yaml), env(vars))
+			}
+			assertTaken := func(t *testing.T, cfg *Config, viaAlias bool) {
+				t.Helper()
+				deprecations := 0
+				if viaAlias {
+					deprecations = 1
+				}
+				if len(cfg.Deprecations) != deprecations {
+					t.Fatalf("deprecations %v, want %d", cfg.Deprecations, deprecations)
+				}
+				if deprecations == 1 && cfg.Deprecations[0] != p.alias+" is deprecated, use "+p.key {
+					t.Fatalf("deprecation message: %q", cfg.Deprecations[0])
+				}
+			}
+			t.Run("key alone", func(t *testing.T) {
+				cfg, err := check(keyFile, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertTaken(t, cfg, false)
+			})
+			t.Run("alias alone", func(t *testing.T) {
+				cfg, err := check(aliasFile, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertTaken(t, cfg, true)
+			})
+			t.Run("both in the file", func(t *testing.T) {
+				_, err := check(keyFile+aliasFile, nil)
+				if err == nil || !strings.Contains(err.Error(), p.key) || !strings.Contains(err.Error(), p.alias) {
+					t.Fatalf("error %v must name %q and %q", err, p.key, p.alias)
+				}
+			})
+			t.Run("key from env, alias in the file", func(t *testing.T) {
+				_, err := check(aliasFile, map[string]string{p.envKey: "from-env"})
+				if err == nil || !strings.Contains(err.Error(), p.key) || !strings.Contains(err.Error(), p.alias) {
+					t.Fatalf("error %v must name %q and %q", err, p.key, p.alias)
+				}
+			})
+			t.Run("alias from env alone", func(t *testing.T) {
+				cfg, err := check("", map[string]string{p.envAlias: p.aliasVal})
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertTaken(t, cfg, true)
+			})
+			t.Run("key from env alone", func(t *testing.T) {
+				cfg, err := check("", map[string]string{p.envKey: p.keyVal})
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertTaken(t, cfg, false)
+			})
+			t.Run("both from env", func(t *testing.T) {
+				_, err := check("", map[string]string{p.envKey: "a", p.envAlias: "b"})
+				if err == nil {
+					t.Fatal("both set must fail validation")
+				}
+			})
+		})
+	}
+}
+
+// The pair values end up in the fields they configure, nested or dotted.
+func TestDeprecatedAliasValuesTakeEffect(t *testing.T) {
+	cfg := mustLoad(t, "http:\n  addr: 0.0.0.0:9000\npprof.addr: 127.0.0.1:6060\nlogLevel: debug\n", nil)
+	if cfg.HealthAddr != "0.0.0.0:9000" || cfg.DebugAddr != "127.0.0.1:6060" || cfg.LogLevel != "debug" {
+		t.Fatalf("alias values: %q %q %q", cfg.HealthAddr, cfg.DebugAddr, cfg.LogLevel)
+	}
+	if cfg, err := Load(writeFile(t, t.TempDir(), "app.yaml", "health.addr: :1\n"), env(nil)); err != nil || cfg.HealthAddr != ":1" {
+		t.Fatalf("health.addr: %v %q", err, cfg.HealthAddr)
+	}
+}
+
+// log.level defaults to info and accepts debug, info, warn and error, in any case; other values
+// fail validation.
+func TestLogLevelValidation(t *testing.T) {
+	if got := mustLoad(t, "", nil).LogLevel; got != "info" {
+		t.Fatalf("default level: %q", got)
+	}
+	for _, level := range []string{"debug", "info", "warn", "error", "WARN"} {
+		if got := mustLoad(t, "log.level: "+level+"\n", nil).LogLevel; got != level {
+			t.Fatalf("level %q: got %q", level, got)
+		}
+	}
+	for _, level := range []string{"trace", "fatal", ""} {
+		if level == "" {
+			continue // unset means the default, tested above
+		}
+		_, err := Load(writeFile(t, t.TempDir(), "app.yaml", "log.level: "+level+"\n"), env(nil))
+		if err == nil || !strings.Contains(err.Error(), "log.level") || !strings.Contains(err.Error(), level) {
+			t.Fatalf("level %q: error %v must name the key and the value", level, err)
 		}
 	}
 }
@@ -271,8 +387,8 @@ func TestExampleConfigs(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		if len(cfg.Warnings) != 0 {
-			t.Errorf("%s: unknown keys %v", name, cfg.Warnings)
+		if len(cfg.Deprecations) != 0 {
+			t.Errorf("%s: deprecated keys %v", name, cfg.Deprecations)
 		}
 		return cfg
 	}
@@ -374,6 +490,9 @@ type compatCase struct {
 	Name string
 	File string
 	Env  map[string]string
+	// Error lists the unknown keys a fixture contains: such a file must fail to load, naming
+	// every one of them (strict keys).
+	Error []string
 }
 
 // The loader must produce exactly what the former viper-based loader did for the snapshots in
@@ -391,6 +510,24 @@ func TestLoadMatchesFormerLoader(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.Name, func(t *testing.T) {
+			cfg, err := Load(filepath.Join(dir, c.File), env(c.Env))
+			if len(c.Error) > 0 {
+				if err == nil {
+					t.Fatalf("a file with unknown keys must fail to load")
+				}
+				for _, want := range c.Error {
+					if !strings.Contains(err.Error(), want) {
+						t.Fatalf("error %v must name %q", err, want)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(cfg.Deprecations) != 0 {
+				t.Errorf("deprecated keys %v must be gone from the fixtures", cfg.Deprecations)
+			}
 			var want compatSnapshot
 			raw, err := os.ReadFile(filepath.Join(dir, c.Name+".golden.json"))
 			if err != nil {
@@ -414,12 +551,8 @@ func TestLoadMatchesFormerLoader(t *testing.T) {
 				want.MetricFile = consts.MetricFile
 			}
 
-			cfg, err := Load(filepath.Join(dir, c.File), env(c.Env))
-			if err != nil {
-				t.Fatal(err)
-			}
 			got := compatSnapshot{
-				LogLevel: cfg.LogLevel, HTTPAddr: cfg.HTTPAddr, PprofAddr: cfg.PprofAddr, AuditEndpoint: cfg.AuditGRPCEndpoint,
+				LogLevel: cfg.LogLevel, HTTPAddr: cfg.HealthAddr, PprofAddr: cfg.DebugAddr, AuditEndpoint: cfg.AuditGRPCEndpoint,
 				KafkaTLSCert: cfg.KafkaTLS.CertPath, KafkaTLSKey: cfg.KafkaTLS.KeyPath, KafkaTLSCA: cfg.KafkaTLS.CAPath,
 				KafkaTLSSkip: cfg.KafkaTLS.SkipVerify, Brokers: cfg.Kafka.Brokers, Version: cfg.Kafka.Version,
 				LogPath: want.LogPath, LogFileName: want.LogFileName,
@@ -478,11 +611,6 @@ func TestRetention(t *testing.T) {
 	cfg := mustLoad(t, "retention:\n  max_backups: 10\n  max_age_days: \"30\"\n", nil)
 	if cfg.Retention != (Retention{MaxBackups: 10, MaxAgeDays: 30}) {
 		t.Fatalf("parsed: %+v", cfg.Retention)
-	}
-	for _, w := range cfg.Warnings {
-		if strings.HasPrefix(w, "retention") {
-			t.Fatalf("retention keys must be known, got warning %q", w)
-		}
 	}
 	for _, bad := range []string{"-1", "month"} {
 		_, err := Load(writeFile(t, t.TempDir(), "app.yaml", "retention:\n  max_age_days: "+bad+"\n"), env(nil))

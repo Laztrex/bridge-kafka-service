@@ -1,6 +1,6 @@
-// Package logging configures the platform log format (docs/conventions.md, section 6): zerolog
-// records with rqTime, loglevel, message, funcName, host and service; stdout gets a plain text
-// console format, the run log file gets JSON with info and error records only.
+// Package logging configures the platform log format (platform spec core/platform-logging):
+// zerolog records with rqTime, loglevel, message, funcName, host and service; stdout gets a
+// plain text console format, the run log file gets JSON with info and error records only.
 package logging
 
 import (
@@ -78,14 +78,22 @@ func Init(logFile string) {
 	log.Logger = zerolog.New(multi).With().Timestamp().Caller().Str("host", host).Str("service", Service).Logger()
 }
 
-// SetLevel applies logLevel from the config: "debug" enables debug records and the Kafka client
-// log; anything else means info.
+// SetLevel applies log.level from the config: debug, info, warn or error. Other values are
+// rejected when the config is validated; if one still arrives here it keeps info. "debug" also
+// enables the Kafka client log.
 func SetLevel(level string) {
-	if level == "debug" {
-		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	var l zerolog.Level
+	switch strings.ToLower(level) {
+	case "debug":
+		l = zerolog.DebugLevel
 		sarama.Logger = logger.New(os.Stderr, "[Sarama] ", logger.LstdFlags)
-	} else {
-		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	case "warn":
+		l = zerolog.WarnLevel
+	case "error":
+		l = zerolog.ErrorLevel
+	default:
+		l = zerolog.InfoLevel
 	}
+	zerolog.SetGlobalLevel(l)
 	log.Info().Msgf("LEVEL %v", level)
 }

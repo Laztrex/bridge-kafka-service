@@ -6,7 +6,7 @@
 # RUNTIME_IMAGE: lightweight runtime image; the binary is static (CGO_ENABLED=0, time zones embedded)
 # and needs only sh (for the setup step below) and the system CA roots.
 # Configuration is mounted at ./configs (see README); it is never baked into the image.
-ARG BUILDER_IMAGE=golang:1.27.2
+ARG BUILDER_IMAGE=golang:1.27.3
 ARG RUNTIME_IMAGE=alpine:3.21
 
 ############################ Builder ############################
@@ -36,7 +36,7 @@ COPY internal ./internal
 
 # Build metadata (make image passes them); BUILD_DATE is an argument so the build stays reproducible.
 # timetzdata embeds the time zone database, so the runtime image needs no tzdata package.
-# BUILD_TAGS are extra Go build tags, comma-separated (docs/conventions.md, section 12): empty is a dev
+# BUILD_TAGS are extra Go build tags, comma-separated (platform spec lang-go/platform-go-quality): empty is a dev
 # build, the release image is built with --build-arg BUILD_TAGS=release.
 ARG VERSION=dev
 ARG BUILT_BY=docker

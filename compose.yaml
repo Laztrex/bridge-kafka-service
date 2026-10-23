@@ -164,7 +164,7 @@ services:
         BUILT_BY: docker-dev
     env_file: ./docker.env
     volumes:
-      # the repository configs (config_app.yaml, config_consumer.yaml, config_producer.yaml)
+      # the repository configs (config_compose.yaml, config_consumer.yaml, config_producer.yaml)
       - ./configs:/go/src/bridge-kafka-service/configs:ro
     depends_on:
       kafka:

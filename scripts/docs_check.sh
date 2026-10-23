@@ -1,7 +1,7 @@
 #!/bin/sh
 # Checks docs against code: every config key (a yaml:"..." or mapstructure:"..." struct tag in
 # CONFIG_SRC) must be documented in each of DOCS as "key:", as in the YAML examples.
-# Shared by the Go services (docs/conventions.md); keep the copies identical.
+# Shared by the Go services (platform spec lang-go/platform-go-quality); keep the copies identical.
 #
 # CONFIG_SRC and DOCS are space-separated lists; the script tests override them.
 

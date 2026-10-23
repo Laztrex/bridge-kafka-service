@@ -4,7 +4,7 @@ The gate runs in CI as part of `make ci` (the `Checks` step of `.github/workflow
 
 ## Why the gate
 
-- The threshold (`COVER_THRESHOLD`) and the per-package floor (`PACKAGE_FLOOR`) are the same for local development and CI; the long-term target is 80% total and 60% per package.
+- The threshold (`COVER_THRESHOLD`) and the per-package floor (`PACKAGE_FLOOR`) are the same for local development and CI: 80% total and 60% per package.
 - The threshold ladder (see below) applies upward pressure; the bar is raised by changing one variable (`COVER_THRESHOLD`/`PACKAGE_FLOOR`, defaults in `make/common.mk`), without code changes.
 - `scripts/coverage.sh` excludes `*.pb.go`, `testutil/`, `test/`, `cmd/` and `examples/` so generated code, the thin entrypoint and runnable examples do not skew the percentage.
 
@@ -13,11 +13,13 @@ The gate runs in CI as part of `make ci` (the `Checks` step of `.github/workflow
 ```yaml
 coverage-check:
   stage: test
-  image: golang:1.27.2
+  image: golang:1.27.3
   variables:
-    COVER_THRESHOLD: "35"        # current ladder step, see table below
+    COVER_THRESHOLD: "80"
+    PACKAGE_FLOOR: "60"
   script:
     - make coverage-check
+    - go tool cover -html=coverage.out -o coverage.html
   artifacts:
     when: always
     paths:
@@ -33,7 +35,7 @@ coverage-check:
 1. total coverage `>= COVER_THRESHOLD` (default **80**, set in `make/common.mk`);
 2. coverage of **every** package `>= PACKAGE_FLOOR` (default **60**), so a well-covered package cannot mask an uncovered one.
 
-Exactly these groups are excluded: generated protobuf (`*.pb.go`), the `testutil/` and `test/` helper packages and the thin `cmd/` entrypoint (flag parsing and `signal.NotifyContext` → `app.Connect`; `Connect` itself is covered by tests). The exclusion list must not grow without a separate change.
+Exactly these groups are excluded: generated protobuf (`*.pb.go`), the `testutil/` and `test/` helper packages, runnable `examples/`, and the thin `cmd/` entrypoint (flag parsing and `signal.NotifyContext` → `app.Connect`; `Connect` itself is covered by tests). The exclusion list must not grow without a separate change.
 
 | Exit code | Meaning |
 |---|---|
@@ -51,18 +53,20 @@ The threshold grew in steps within one change (`raise-coverage-to-80-and-prune-s
 | Initial | `35` | — | passed |
 | After `router` | `60` | `0` | passed |
 | After `observability` and `utils` | `70` | `0` | passed |
-| Final | `80` | `60` | **in effect** (actual: 94.1% total, lowest package 91.0%) |
+| Final | `80` | `60` | **in effect** |
+
+The 2026-10-23 `make ci` run on Go 1.27.3 measured 94.4% total coverage; the lowest included package was 91.3% (`internal/observability`).
 
 Override for a local check: `COVER_THRESHOLD=50 PACKAGE_FLOOR=40 make coverage-check`.
 
 ## Generated code check
 
-`make proto-check` regenerates the gRPC stubs into a temp directory and compares them with the committed ones (`internal/transport/modelrpc`); the `protoc` version line is ignored. In CI (the `CI` variable is set) a missing `protoc` is an error. Add it to the pipeline after `make coverage-check`:
+`make proto-check` regenerates the gRPC stubs into a temp directory and compares them with the committed ones (`internal/transport/modelrpc`); the `protoc` version line is ignored. In CI (the `CI` variable is set) a missing `protoc` is an error. The project's `make ci` already includes this check. For another CI runner, an equivalent job is:
 
 ```yaml
 proto-check:
   stage: test
-  image: golang:1.27.2   # + protoc installed
+  image: golang:1.27.3   # + protoc installed
   script:
     - make proto-check
 ```

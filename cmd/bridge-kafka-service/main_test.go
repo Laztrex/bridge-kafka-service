@@ -77,7 +77,6 @@ consumer:
     service:
       name: svc
       port: "8080"
-unknown_key: 1
 `
 
 func TestCheckConfig_ValidConfiguration(t *testing.T) {
@@ -92,8 +91,41 @@ func TestCheckConfig_ValidConfiguration(t *testing.T) {
 	if !strings.Contains(out.String(), "is valid") {
 		t.Fatalf("stdout must state the configuration is valid: %q", out.String())
 	}
-	if !strings.Contains(errOut.String(), `warning: unknown config key "unknown_key" is ignored`) {
-		t.Fatalf("the unknown-key warning must be printed: %q", errOut.String())
+	if errOut.Len() != 0 {
+		t.Fatalf("a valid configuration prints no warnings, stderr: %q", errOut.String())
+	}
+}
+
+// An unknown key fails --check-config with exit code 1 and the key named on stderr.
+func TestCheckConfig_UnknownKey(t *testing.T) {
+	path := checkDir(t, validConfig+"unknown_key: 1\n")
+	var out, errOut bytes.Buffer
+
+	code := run([]string{"--check-config", "--config", path}, &out, &errOut)
+
+	if code != 1 {
+		t.Fatalf("exit code %d, want 1", code)
+	}
+	if !strings.Contains(errOut.String(), `error: unknown config key "unknown_key"`) {
+		t.Fatalf("the unknown key must be named: %q", errOut.String())
+	}
+	if strings.Contains(out.String(), "is valid") {
+		t.Fatalf("stdout must not state the configuration is valid: %q", out.String())
+	}
+}
+
+// A deprecated alias still loads and is reported as a warning.
+func TestCheckConfig_DeprecatedAlias(t *testing.T) {
+	path := checkDir(t, validConfig+"http.addr: 0.0.0.0:9000\n")
+	var out, errOut bytes.Buffer
+
+	code := run([]string{"--check-config", "--config", path}, &out, &errOut)
+
+	if code != 0 {
+		t.Fatalf("exit code %d, stderr:\n%s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "warning: http.addr is deprecated, use health.addr") {
+		t.Fatalf("the deprecation must be printed: %q", errOut.String())
 	}
 }
 

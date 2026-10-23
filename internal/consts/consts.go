@@ -100,39 +100,47 @@ const (
 	EventNameBusinessRequestKafka       = "BusinessRequestKafka"
 )
 
-// Metric names written to the metrics file.
+// Metric names written to the metrics file. Every name carries the service prefix
+// `bridge_kafka_service_` (MET-2); the former `controller_kafka_` and `bridge_service_`
+// spellings are gone — see README "Metrics" for the old-to-new table.
 const (
 	FieldMetricRquid           = "rqUId"
-	FieldMetricCpuUsagePercent = "bridge_service_pod_cpu_usage"
-	FieldMetricRamUsageMb      = "bridge_service_pod_memory_usage"
+	FieldMetricCpuUsagePercent = MetricPrefix + "pod_cpu_usage"
+	FieldMetricRamUsageMb      = MetricPrefix + "pod_memory_usage"
 )
 
+// MetricPrefix starts every metric name the service writes.
+const MetricPrefix = "bridge_kafka_service_"
+
+// metricName joins the service prefix with an event's metric suffix.
+func metricName(event, suffix string) string { return MetricPrefix + event + "_" + suffix }
+
 var MetricsSuccessMapName = map[EventType]string{
-	EventProduce:         "controller_kafka_produce_success_total",
-	EventConsume:         "controller_kafka_consume_success_total",
-	EventRequestService:  "controller_kafka_request_service_success_total",
-	EventResponseService: "controller_kafka_response_service_success_total",
+	EventProduce:         metricName("produce", "success_total"),
+	EventConsume:         metricName("consume", "success_total"),
+	EventRequestService:  metricName("request_service", "success_total"),
+	EventResponseService: metricName("response_service", "success_total"),
 }
 
 var MetricsFailureMapName = map[EventType]string{
-	EventProduce:         "controller_kafka_produce_failure_total",
-	EventConsume:         "controller_kafka_consume_failure_total",
-	EventRequestService:  "controller_kafka_request_service_failure_total",
-	EventResponseService: "controller_kafka_response_service_failure_total",
+	EventProduce:         metricName("produce", "failure_total"),
+	EventConsume:         metricName("consume", "failure_total"),
+	EventRequestService:  metricName("request_service", "failure_total"),
+	EventResponseService: metricName("response_service", "failure_total"),
 }
 
 var MetricsRequestMapName = map[EventType]string{
-	EventProduce:         "controller_kafka_produce_requests_total",
-	EventConsume:         "controller_kafka_consume_requests_total",
-	EventRequestService:  "controller_kafka_request_service_requests_total",
-	EventResponseService: "controller_kafka_response_service_requests_total",
+	EventProduce:         metricName("produce", "requests_total"),
+	EventConsume:         metricName("consume", "requests_total"),
+	EventRequestService:  metricName("request_service", "requests_total"),
+	EventResponseService: metricName("response_service", "requests_total"),
 }
 
 var MetricsDurationMapName = map[EventType]string{
-	EventProduce:         "controller_kafka_produce_duration_ms",
-	EventConsume:         "controller_kafka_consume_duration_ms",
-	EventRequestService:  "controller_kafka_request_service_duration_ms",
-	EventResponseService: "controller_kafka_response_service_duration_ms",
+	EventProduce:         metricName("produce", "duration_ms"),
+	EventConsume:         metricName("consume", "duration_ms"),
+	EventRequestService:  metricName("request_service", "duration_ms"),
+	EventResponseService: metricName("response_service", "duration_ms"),
 }
 
 var LogMapEventName = map[EventType]string{

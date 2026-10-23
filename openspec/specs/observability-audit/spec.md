@@ -8,7 +8,7 @@ Records every event the system processes as a structured metric line and as an E
 ### Requirement: Four-event taxonomy
 The system MUST recognise four distinct event types tied to its lifecycle: record consumed from Kafka (`consume`), record produced to Kafka (`produce`), outbound call dispatched to upstream service (`request_service`), and upstream response routed back into Kafka (`response_service`). Each event type maps to a stable pair of human-readable label and set of metric names.
 
-Metric names keep the legacy `controller_kafka_<event>_{success_total,failure_total,requests_total,duration_ms}` form (see spec project-identity).
+Metric names are `bridge_kafka_service_<event>_{success_total,failure_total,requests_total,duration_ms}`; the resource metrics are `bridge_kafka_service_pod_cpu_usage` and `bridge_kafka_service_pod_memory_usage`.
 
 #### Scenario: Swallowed errors are logged
 - **WHEN** the metric or audit goroutine receives an error from its error channel
@@ -17,6 +17,10 @@ Metric names keep the legacy `controller_kafka_<event>_{success_total,failure_to
 #### Scenario: All four event types recorded on round-trip
 - **WHEN** one record travels through consume → request_service → produce path
 - **THEN** exactly three events are emitted with their respective labels and metrics
+
+#### Scenario: Metric prefix
+- **WHEN** a `request_service` event fails
+- **THEN** the metric file gets `bridge_kafka_service_request_service_failure_total` with value `1`
 
 ### Requirement: Per-event metric lines written to local file
 For every event the system MUST append a JSON-formatted log line containing the Request-Id, the metric name (specific to event type), and the metric value (success counter, failure counter, total requests, or duration in milliseconds). Lines MUST be written sequentially; partial writes MUST NOT interleave within a single line. An event's duration is measured from that event's own start to the moment the event is closed; it MUST NOT depend on any other event and MUST NOT include time the closed event spends waiting to be written.

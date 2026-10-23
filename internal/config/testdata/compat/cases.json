@@ -3,8 +3,8 @@
   {"name": "example_grpc", "file": "example_grpc.yaml"},
   {"name": "example_grpc_mtls", "file": "example_grpc_mtls.yaml"},
   {"name": "example_local_http", "file": "example_local_http.yaml"},
-  {"name": "edge", "file": "edge.yaml"},
-  {"name": "edge_env", "file": "edge.yaml", "env": {
+  {"name": "edge", "file": "edge.yaml", "error": ["unknown config key \"consumer[0].unknown_consumer_key\"", "unknown config key \"unknown_top_level\""]},
+  {"name": "edge_env", "file": "edge.yaml", "error": ["unknown config key \"consumer[0].unknown_consumer_key\"", "unknown config key \"unknown_top_level\""], "env": {
     "HTTP_ADDR": "1.2.3.4:1", "LOGLEVEL": "error", "PPROF_ADDR": "", "AUDIT_GRPC_ENDPOINT": "env-als:1",
     "KAFKA_TLS_CA_PATH": "env-ca.pem", "KAFKA_TLS_SKIP_INSECURE_VERIFY": "false",
     "LOG_PATH": "/env/log", "LOG_FILE_NAME": "env.log", "METRIC_PATH": "/env/metric", "METRIC_FILE_NAME": "env-metrics.log",

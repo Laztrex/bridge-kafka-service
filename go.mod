@@ -1,6 +1,6 @@
 module bridge-kafka-service
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/IBM/sarama v1.60.2

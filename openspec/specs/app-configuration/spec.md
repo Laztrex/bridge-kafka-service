@@ -6,15 +6,30 @@ Defines how the service locates and layers its configuration (command-line flag,
 ## Requirements
 
 ### Requirement: Backward-compatible config format
-The loader MUST accept every config file the former viper-based loader accepted and MUST produce the same values for it: keys are case-insensitive; a nested key MAY be written nested or dotted; a non-empty environment variable named after a top-level key (upper case, dots as underscores) overrides it; strings split into lists on commas where a list is expected and scalars convert weakly (`port: 8080` is `"8080"`). Unknown keys MUST NOT stop startup: each MUST be logged as a warning. Loading MUST NOT use global state and MUST return errors instead of exiting.
+The loader MUST accept every config file the former viper-based loader accepted that contains only known keys, and MUST produce the same values for it: keys are case-insensitive; a nested key MAY be written nested or dotted; a non-empty environment variable named after a top-level key (upper case, dots as underscores) overrides it; strings split into lists on commas where a list is expected and scalars convert weakly (`port: 8080` is `"8080"`). An unknown key MUST stop startup with an error naming it, reported together with every other configuration error. Loading MUST NOT use global state and MUST return errors instead of exiting.
 
 #### Scenario: Former files load unchanged
-- **WHEN** the stand config, the examples and the edge-case fixtures in `internal/config/testdata/compat` are loaded with their recorded environment
+- **WHEN** the stand config, the examples and the edge-case fixtures in `internal/config/testdata/compat` without unknown keys are loaded with their recorded environment
 - **THEN** every value equals the snapshot recorded from the former loader
 
 #### Scenario: Unknown key
-- **WHEN** the file contains a key the loader does not know
-- **THEN** the service starts and logs `unknown config key "<key>" is ignored`
+- **WHEN** the file contains the keys `kafka.brokrs` and `timeouts.shutdwon`, which the loader does not know
+- **THEN** startup fails with `unknown config key "kafka.brokrs"` and `unknown config key "timeouts.shutdwon"`, and no listener or Kafka client is started
+
+### Requirement: Deprecated key aliases
+The keys `http.addr`, `pprof.addr` and `logLevel` MUST be accepted as deprecated aliases of `health.addr`, `debug.addr` and `log.level`, including their environment overrides. An alias used alone MUST take effect and MUST be logged once as deprecated, naming the key to use. A key and its alias set together MUST fail validation, naming both. `log.level` MUST default to `info`.
+
+#### Scenario: Deployed file with the old key
+- **WHEN** the file sets `http.addr: 0.0.0.0:9000` and no `health.addr`
+- **THEN** the service HTTP server listens on `0.0.0.0:9000` and startup logs `http.addr is deprecated, use health.addr`
+
+#### Scenario: Key and alias together
+- **WHEN** the file sets both `logLevel: debug` and `log.level: info`
+- **THEN** startup fails with an error naming `logLevel` and `log.level`
+
+#### Scenario: Level not set
+- **WHEN** neither `log.level` nor `logLevel` is set
+- **THEN** the log level is `info`
 
 ### Requirement: Configurable shutdown timeout
 `timeouts.shutdown` (a Go duration, default `10s`) MUST bound both the HTTP server drain and the wait for active upstream calls on termination. A non-positive or malformed value MUST stop startup.
@@ -24,7 +39,7 @@ The loader MUST accept every config file the former viper-based loader accepted 
 - **THEN** the call gets up to 25 seconds to finish before it is aborted without settling its offset
 
 ### Requirement: Application config file resolution
-The system MUST resolve the application config file (`kafka`, `consumer`, `producer`, `audit`, `http`, `logLevel` keys) in this order, taking the first that is set: the `--config` / `-c` command-line flag, the `CONFIG_PATH` environment variable, `CONFIG_PATH` from the `.env` file in the working directory, then the built-in default `configs/config_app.yaml`. The file MUST always be loaded, whether or not an env file (`.env`) exists.
+The system MUST resolve the application config file (`kafka`, `consumer`, `producer`, `audit`, `health`, `log` keys) in this order, taking the first that is set: the `--config` / `-c` command-line flag, the `CONFIG_PATH` environment variable, `CONFIG_PATH` from the `.env` file in the working directory, then the built-in default `configs/config_app.yaml`. The file MUST always be loaded, whether or not an env file (`.env`) exists.
 
 #### Scenario: Flag wins
 - **WHEN** the binary starts with `--config /etc/bridge/app.yaml` and `CONFIG_PATH` points elsewhere
@@ -88,14 +103,14 @@ Sarama consumer and producer tunables MUST be read from `configs/config_consumer
 - **THEN** the consumer client is created with auto-commit enabled
 
 ### Requirement: Diagnostic listener isolation
-Go runtime profiling (pprof) MUST NOT be reachable on the public HTTP listener (`http.addr`). It MUST be served only when `pprof.addr` is configured, on that separate address; a `pprof.addr` that is not a loopback address MUST be logged as a warning.
+Go runtime profiling (pprof) MUST NOT be reachable on the service HTTP listener (`health.addr`). It MUST be served only when `debug.addr` is configured, on that separate address; a `debug.addr` that is not a loopback address MUST be logged as a warning.
 
 #### Scenario: Default deployment
-- **WHEN** `pprof.addr` is not configured
-- **THEN** requests to `/debug/pprof/` on `http.addr` return 404 and no pprof listener is started
+- **WHEN** `debug.addr` is not configured
+- **THEN** requests to `/debug/pprof/` on `health.addr` return 404 and no profiling listener is started
 
 #### Scenario: Profiling enabled
-- **WHEN** `pprof.addr: 127.0.0.1:6060` is configured
+- **WHEN** `debug.addr: 127.0.0.1:6060` is configured
 - **THEN** pprof handlers answer on that address only
 
 ### Requirement: Fatal startup preconditions
@@ -214,8 +229,18 @@ The binary MUST accept `--check-config`. In that mode it MUST resolve and load t
 
 #### Scenario: Valid configuration
 
-- **WHEN** `bridge-kafka-service --check-config --config app.yaml` runs against a valid file with one unknown key
-- **THEN** the unknown-key warning is printed, a line states that the configuration is valid, and the exit code is 0
+- **WHEN** `bridge-kafka-service --check-config --config app.yaml` runs against a valid file with no unknown keys
+- **THEN** a line states that the configuration is valid, and the exit code is 0
+
+#### Scenario: Unknown application key
+
+- **WHEN** the command runs against a file with an unknown application configuration key
+- **THEN** an error names the key, no line states that the configuration is valid, and the exit code is 1
+
+#### Scenario: Deprecated alias in check mode
+
+- **WHEN** the command runs against a valid file using `http.addr` without `health.addr`
+- **THEN** a warning states `http.addr is deprecated, use health.addr`, the configuration is reported as valid, and the exit code is 0
 
 #### Scenario: Invalid configuration
 
@@ -339,12 +364,14 @@ The configuration MUST accept `retention.max_backups` and `retention.max_age_day
 
 ## Technical Notes
 
-Keys of the application config (checked against this spec by `make docs-check`):
+Keys of the application config (checked against this spec by `make docs-check`). The deprecated
+aliases `http.addr`, `pprof.addr` and `logLevel` are also accepted (see the requirement
+"Deprecated key aliases"); they are not listed as keys:
 
 ```yaml
-logLevel:
-http.addr:
-pprof.addr:
+log.level:
+health.addr:
+debug.addr:
 audit.grpc_endpoint:
 timeouts.shutdown:
 retention.max_backups:

@@ -1,5 +1,5 @@
-logLevel: debug
-http.addr: 0.0.0.0:8081
+log.level: debug
+health.addr: 0.0.0.0:8081
 
 kafka:
   brokers: kafka:29092,kafka2:29093,kafka3:29094,kafka4:29095

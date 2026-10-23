@@ -1,20 +1,29 @@
 schema: spec-driven
 
+references:
+  - id: platform
+    remote: git@github.com:Laztrex/platform-standards.git
+
 context: |
+  The platform store is binding (layers: core, env-public, lang-go).
+  Read core/platform-sdd-workflow (SDD-*) before writing any artifact or code; the platform
+  version followed is in .platform-standards.yaml (aligned_with), deviations need an approved
+  exemption in the platform registry (exemptions/).
   Project: bridge-kafka-service.
   Purpose: bridge between Kafka topics and external services. Consumes records,
   forwards them to a configured upstream (HTTP or gRPC per consumer, optional TLS/mTLS),
   publishes the upstream response to a response topic, and exposes an HTTP
   publish API. Every step is audited as Envoy ALS entries and metric lines.
-  Tech stack: Go 1.27.2 (module `bridge-kafka-service`), IBM/sarama, YAML
+  Tech stack: Go 1.27.3 (module `bridge-kafka-service`), IBM/sarama, YAML
   configs under `configs/`, zerolog, the standard flag package, gRPC (upstream Predict + Envoy ALS v3), net/http ServeMux.
   Layout: cmd/bridge-kafka-service (entrypoint), internal/{app,router,transport,
   codec,config,logging,middlewares,handlers,observability,schemas,consts},
   testutil/ (mocks), scripts/, make/, docs/.
   Conventions:
-    - Wire-level identifiers keep legacy `controller-kafka` names (headers
-      `x-controller-kafka-*`, metric names, ALS values, gRPC method
-      `/controller_kafka.BaseModelInterface/Predict`); see spec project-identity.
+    - Wire-level identifiers are frozen by spec project-identity: headers
+      `x-bridge-kafka-produce-topic` and `x-bridge-kafka-header-*`, legacy ALS values,
+      and gRPC method `/controller_kafka.BaseModelInterface/Predict`.
+      Metric names use the service prefix `bridge_kafka_service_`.
     - Offsets are settled only after full processing (at-least-once).
     - Tests mock Kafka/gRPC/HTTP boundaries via testutil/; `make test` runs -race;
       `make coverage-check` enforces 80% total / 60% per package (see spec quality-gates);

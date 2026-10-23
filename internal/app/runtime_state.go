@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"net/http"
+	"sync"
 	"sync/atomic"
 
 	"github.com/rs/zerolog/log"
@@ -12,18 +13,24 @@ import (
 	"bridge-kafka-service/internal/transport"
 )
 
-// readiness tracks what /readyz reports: the shared producer is connected (when producers are
-// configured) and the consumer client of every active stanza (one with topics) is up. Liveness (/healthz, /health) does not depend on it:
-// an unreachable Kafka must not make the orchestrator restart a healthy process.
-// It also owns the runtime state of every active pipeline, in configuration order, and the
-// process-wide pause state, which /status reports and readiness ignores.
-type readiness struct {
+// runtimeState owns the application's probe, pipeline and shutdown state. Connect
+// controls its lifecycle; HTTP handlers read it for readiness and detailed status.
+// Readiness checks client initialization and draining, not live broker reachability.
+// Pipeline retries and process-wide pause are reported by /status independently.
+type runtimeState struct {
 	registry       *router.ProducerRegistry
 	needsProducer  bool
 	consumersTotal int
 	consumersUp    atomic.Int32
 	pipelines      []pipeline
 	pause          *router.Pause
+
+	// draining is set when shutdown starts: /readyz answers 503 with the reason "shutting
+	// down" and the publish API answers 503, while /healthz, /health and /status keep
+	// answering until the HTTP server stops.
+	draining atomic.Bool
+	// inFlightPublish tracks publish requests being served, so the drain can wait for them.
+	inFlightPublish sync.WaitGroup
 }
 
 // pipeline is one active stanza and its runtime state.
@@ -32,13 +39,13 @@ type pipeline struct {
 	state *transport.PipelineState
 }
 
-func newReadiness(registry *router.ProducerRegistry, kafkaConfig *schemas.KafkaInfo) *readiness {
+func newRuntimeState(registry *router.ProducerRegistry, kafkaConfig *schemas.KafkaInfo) *runtimeState {
 	active := activeConsumers(kafkaConfig)
 	pipelines := make([]pipeline, len(active))
 	for i, c := range active {
 		pipelines[i] = pipeline{conf: c, state: transport.NewPipelineState()}
 	}
-	return &readiness{
+	return &runtimeState{
 		registry:       registry,
 		needsProducer:  len(kafkaConfig.Producers) > 0,
 		consumersTotal: len(active),
@@ -48,11 +55,20 @@ func newReadiness(registry *router.ProducerRegistry, kafkaConfig *schemas.KafkaI
 }
 
 // consumerUp records that one more consumer client is initialized and subscribing.
-func (r *readiness) consumerUp() { r.consumersUp.Add(1) }
+func (r *runtimeState) consumerUp() { r.consumersUp.Add(1) }
 
-// reasons lists why the service is not ready; empty means ready.
-func (r *readiness) reasons() []string {
+// beginDrain marks the service as shutting down (design D4): /readyz answers 503 with the
+// reason "shutting down" and new publish requests answer 503, while the liveness probes and
+// /status keep answering until the HTTP server stops.
+func (r *runtimeState) beginDrain() { r.draining.Store(true) }
+
+// reasons lists why the service is not ready; empty means ready. While draining, "shutting
+// down" comes first and /readyz answers 503 whatever the other reasons say.
+func (r *runtimeState) reasons() []string {
 	var out []string
+	if r.draining.Load() {
+		out = append(out, "shutting down")
+	}
 	if r.needsProducer && !r.registry.Ready() {
 		out = append(out, "kafka producer is not connected")
 	}
@@ -87,7 +103,7 @@ type pipelineStatus struct {
 	Paused               bool     `json:"paused"`
 }
 
-func (r *readiness) serveReadyz(w http.ResponseWriter, _ *http.Request) {
+func (r *runtimeState) serveReadyz(w http.ResponseWriter, _ *http.Request) {
 	resp, code := readyResponse{Status: "ready"}, http.StatusOK
 	if reasons := r.reasons(); len(reasons) > 0 {
 		resp, code = readyResponse{Status: "not ready", Reasons: reasons}, http.StatusServiceUnavailable
@@ -95,7 +111,7 @@ func (r *readiness) serveReadyz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, code, resp)
 }
 
-func (r *readiness) serveStatus(w http.ResponseWriter, _ *http.Request) {
+func (r *runtimeState) serveStatus(w http.ResponseWriter, _ *http.Request) {
 	reasons := r.reasons()
 	pipelines := make([]pipelineStatus, len(r.pipelines))
 	for i, p := range r.pipelines {

@@ -51,18 +51,25 @@ sequenceDiagram
     end
 ```
 
-At every step the service writes `controller_kafka_*` metrics to a file and audit to ALS
+At every step the service writes `bridge_kafka_service_*` metrics to a file and audit to ALS
 (file and gRPC). They are not shown on the diagram.
 
 ## Key points
 
+- **Broker outages do not terminate startup retries.** Producer and consumer clients
+  retry with exponential backoff and jitter until shutdown. The HTTP server stays
+  available: `/healthz` answers 200 and `/readyz` answers 503 while required clients
+  initialize. Consumers wait for the configured producer to be ready. Readiness tracks
+  initialization and draining, not continuous broker reachability; pause and upstream
+  retries are reported separately in `/status`.
 - **The offset is committed after processing.** A record counts as processed when
   the response is written to Kafka or the upstream call has finally failed. Offsets
   are committed strictly in read order. When the consumer group session ends (shutdown
   or rebalance), the claim waits up to `timeouts.shutdown` for its in-flight records,
   so the ones that finish are committed before the partition is released; records of
   the ended session that were not sent to the service yet are not sent at all. Only
-  calls still running after the wait are redelivered.
+  records whose full processing is still unfinished after the wait are redelivered,
+  including responses still waiting to be published.
 - **Response publication follows `on_failure` too.** Under `skip` a failed write to
   `response_topic` is recorded as a failure and the offset is settled. Under
   `retry` the write is repeated with the shared backoff (1s doubling up to 30s)
@@ -99,5 +106,7 @@ At every step the service writes `controller_kafka_*` metrics to a file and audi
   connections instead of reconnecting.
 - **Signals:** `SIGUSR1` pauses or resumes consumption of the whole process: partitions
   received while paused stay paused, and already delivered records are held until resume.
-  `SIGINT`/`SIGTERM` stop the service: intake stops, upstream calls get
-  up to `timeouts.shutdown` (default 10s) to finish, and accumulated responses are published.
+  `SIGINT`/`SIGTERM` stop the service: the publish API and `/readyz` answer 503 with
+  `shutting down` while `/healthz`, `/health` and `/status` keep answering, intake stops,
+  upstream calls get up to `timeouts.shutdown` (default 10s) to finish, accumulated responses
+  are published, and the HTTP server closes last.
